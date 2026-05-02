@@ -56,6 +56,23 @@ def test_price_reading_from_rtds_prefers_value_field():
     assert reading.price == 101.25
 
 
+def test_price_reading_from_rtds_extracts_nested_value():
+    event = DataEvent(
+        source="polymarket_rtds",
+        event_type=EventType.RTDS_CRYPTO_PRICE,
+        event_ts_ms=None,
+        received_ts_ms=1000,
+        key="fallback",
+        payload={"data": {"symbol": "btcusdt", "value": "100.5"}},
+    )
+
+    reading = price_reading_from_event(event)
+
+    assert reading is not None
+    assert reading.symbol == "btcusdt"
+    assert reading.price == 100.5
+
+
 def test_price_reading_from_kraken_normalizes_usd_pair():
     event = DataEvent(
         source="kraken",

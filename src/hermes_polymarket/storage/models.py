@@ -66,6 +66,19 @@ ON data_events(source, event_type, received_ts_ms);
 CREATE INDEX IF NOT EXISTS idx_data_events_key
 ON data_events(event_key, received_ts_ms);
 
+CREATE TABLE IF NOT EXISTS raw_source_samples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  event_key TEXT NOT NULL,
+  received_ts_ms INTEGER NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_raw_source_samples_source
+ON raw_source_samples(source, received_ts_ms);
+
 CREATE TABLE IF NOT EXISTS source_health (
   source TEXT PRIMARY KEY,
   last_seen_ts_ms INTEGER NOT NULL,

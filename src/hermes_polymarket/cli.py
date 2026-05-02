@@ -693,6 +693,9 @@ def cmd_learning_retire(args: argparse.Namespace) -> int:
 
 
 def cmd_crypto_latency_discover(args: argparse.Namespace) -> int:
+    from collections import Counter
+
+    from hermes_polymarket.crypto.crypto_market_classifier import crypto_market_reject_reason
     from hermes_polymarket.crypto.market_resolver import market_window_from_gamma_market
     from hermes_polymarket.data_sources.base import now_ms
     from hermes_polymarket.polymarket.gamma_client import GammaClient
@@ -704,10 +707,15 @@ def cmd_crypto_latency_discover(args: argparse.Namespace) -> int:
     db.init_schema(settings.initial_bankroll)
     gamma = GammaClient()
     try:
-        query_terms = args.query or ["bitcoin up down", "ethereum up down", "solana up down", "xrp up down"]
+        query_terms = args.query or ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "crypto", "up or down", "higher or lower", "rise or fall"]
         discovered: dict[tuple[str, str, str], dict[str, Any]] = {}
+        candidates: list[dict[str, Any]] = []
         for query in query_terms:
-            for market in gamma.search_markets(query, limit=args.max_markets):
+            market_rows = gamma.search_markets(query, limit=args.max_markets)
+            event_rows = gamma.search_events(query, limit=args.max_markets)
+            nested_market_rows = [market for event in event_rows for market in (event.get("markets") or []) if isinstance(market, dict)]
+            for market in [*market_rows, *nested_market_rows]:
+                candidates.append(market)
                 window = market_window_from_gamma_market(market)
                 if window is None:
                     continue
@@ -723,6 +731,7 @@ def cmd_crypto_latency_discover(args: argparse.Namespace) -> int:
         payload = crypto_latency_report(db)
         payload["status"] = "measurement_only"
         payload["discovered"] = len(discovered)
+        payload["candidates_seen"] = len(candidates)
         payload["markets"] = [
             {
                 "condition_id": row["condition_id"],
@@ -733,6 +742,20 @@ def cmd_crypto_latency_discover(args: argparse.Namespace) -> int:
             }
             for row in discovered.values()
         ]
+        if args.debug_candidates:
+            rejected: list[dict[str, str]] = []
+            reason_counts: Counter[str] = Counter()
+            for market in candidates:
+                slug = str(market.get("slug") or "")
+                question = str(market.get("question") or market.get("title") or "")
+                reason = crypto_market_reject_reason(question, slug) or "classified_or_missing_tokens"
+                if reason != "classified_or_missing_tokens":
+                    reason_counts[reason] += 1
+                rejected.append({"slug": slug, "question": question, "reason": reason})
+            payload["debug"] = {
+                "rejected_reason_counts": dict(reason_counts),
+                "top_rejected": rejected[: min(25, len(rejected))],
+            }
         print(json.dumps(payload, indent=2, sort_keys=True))
     finally:
         gamma.close()
@@ -878,14 +901,36 @@ def cmd_crypto_latency_source_health(_: argparse.Namespace) -> int:
 
 
 def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
-    from hermes_polymarket.storage.crypto_watchlist import crypto_market_watchlist
+    from hermes_polymarket.data_sources.base import now_ms
+    from hermes_polymarket.storage.crypto_watchlist import clear_crypto_market_watchlist, crypto_market_watchlist, upsert_crypto_market_watchlist
 
     settings = _settings()
     db = Database(settings.database_path)
     db.init_schema(settings.initial_bankroll)
     try:
-        rows = crypto_market_watchlist(db, active_only=not args.all, limit=args.limit)
-        print(json.dumps({"mode": "measurement_paper_only", "watchlist": rows}, indent=2, sort_keys=True))
+        if args.watchlist_action == "add":
+            upsert_crypto_market_watchlist(
+                db,
+                {
+                    "condition_id": args.condition_id,
+                    "slug": args.slug,
+                    "question": args.question or args.slug,
+                    "symbol": args.symbol.lower(),
+                    "yes_token_id": args.yes_token_id,
+                    "no_token_id": args.no_token_id,
+                    "active": True,
+                    "discovered_at_ms": now_ms(),
+                    "raw": {"manual": True},
+                },
+            )
+            rows = crypto_market_watchlist(db, active_only=False, limit=args.limit)
+            print(json.dumps({"mode": "measurement_paper_only", "status": "added", "watchlist": rows}, indent=2, sort_keys=True))
+        elif args.watchlist_action == "clear":
+            deleted = clear_crypto_market_watchlist(db)
+            print(json.dumps({"mode": "measurement_paper_only", "status": "cleared", "deleted": deleted}, indent=2, sort_keys=True))
+        else:
+            rows = crypto_market_watchlist(db, active_only=not args.all, limit=args.limit)
+            print(json.dumps({"mode": "measurement_paper_only", "watchlist": rows}, indent=2, sort_keys=True))
     finally:
         db.close()
     return 0
@@ -961,7 +1006,12 @@ def cmd_crypto_latency_threshold_sweep(args: argparse.Namespace) -> int:
             prices=prices,
             thresholds_pct=thresholds,
             lookback_ms=args.lookback_ms,
+            cooldown_ms=args.cooldown_ms,
         )
+        threshold_payload = {
+            str(result.threshold_pct): {"hits": result.hits, "max_move_pct": result.max_move_pct}
+            for result in results
+        }
         print(
             json.dumps(
                 {
@@ -969,12 +1019,27 @@ def cmd_crypto_latency_threshold_sweep(args: argparse.Namespace) -> int:
                     "symbol": args.symbol.lower(),
                     "lookback_ms": args.lookback_ms,
                     "data_points": len(prices),
+                    "thresholds": threshold_payload,
                     "threshold_sweep": [result.__dict__ for result in results],
                 },
                 indent=2,
                 sort_keys=True,
             )
         )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_latency_raw_samples(args: argparse.Namespace) -> int:
+    from hermes_polymarket.storage.raw_samples import raw_samples
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        rows = raw_samples(db, source=args.source, limit=args.last)
+        print(json.dumps({"mode": "measurement_paper_only", "raw_samples": rows}, indent=2, sort_keys=True))
     finally:
         db.close()
     return 0
@@ -1160,6 +1225,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_discover = crypto_sub.add_parser("discover")
     crypto_discover.add_argument("--max-markets", type=int, default=20)
     crypto_discover.add_argument("--query", action="append", help="Gamma search query; may be repeated")
+    crypto_discover.add_argument("--debug-candidates", action="store_true")
     crypto_discover.set_defaults(func=cmd_crypto_latency_discover)
     crypto_record = crypto_sub.add_parser("record")
     crypto_record.add_argument("--seconds", type=int, default=300)
@@ -1180,6 +1246,15 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_watchlist = crypto_sub.add_parser("watchlist")
     crypto_watchlist.add_argument("--limit", type=int, default=50)
     crypto_watchlist.add_argument("--all", action="store_true")
+    watchlist_sub = crypto_watchlist.add_subparsers(dest="watchlist_action")
+    watchlist_add = watchlist_sub.add_parser("add")
+    watchlist_add.add_argument("--condition-id", required=True)
+    watchlist_add.add_argument("--slug", required=True)
+    watchlist_add.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    watchlist_add.add_argument("--yes-token-id", required=True)
+    watchlist_add.add_argument("--no-token-id", required=True)
+    watchlist_add.add_argument("--question", default=None)
+    watchlist_clear = watchlist_sub.add_parser("clear")
     crypto_watchlist.set_defaults(func=cmd_crypto_latency_watchlist)
     crypto_health = crypto_sub.add_parser("source-health")
     crypto_health.set_defaults(func=cmd_crypto_latency_source_health)
@@ -1194,9 +1269,14 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_sweep = crypto_sub.add_parser("threshold-sweep")
     crypto_sweep.add_argument("--symbol", required=True)
     crypto_sweep.add_argument("--lookback-ms", type=int, default=3000)
+    crypto_sweep.add_argument("--cooldown-ms", type=int, default=0)
     crypto_sweep.add_argument("--thresholds", default="0.03,0.05,0.08,0.12")
     crypto_sweep.add_argument("--last", type=int, default=5000)
     crypto_sweep.set_defaults(func=cmd_crypto_latency_threshold_sweep)
+    crypto_raw = crypto_sub.add_parser("raw-samples")
+    crypto_raw.add_argument("--source", required=True)
+    crypto_raw.add_argument("--last", type=int, default=20)
+    crypto_raw.set_defaults(func=cmd_crypto_latency_raw_samples)
     crypto_opps = crypto_sub.add_parser("opportunities")
     crypto_opps.add_argument("--limit", type=int, default=50)
     crypto_opps.set_defaults(func=cmd_crypto_latency_opportunities)

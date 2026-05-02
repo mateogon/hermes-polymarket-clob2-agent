@@ -72,9 +72,16 @@ rtds:
 
 market_discovery:
   query_terms:
-    - bitcoin up down
-    - ethereum up down
-    - solana up down
-    - xrp up down
+    - bitcoin
+    - btc
+    - ethereum
+    - eth
+    - solana
+    - sol
+    - xrp
+    - crypto
+    - up or down
+    - higher or lower
+    - rise or fall
   max_markets: 20
   refresh_seconds: 60

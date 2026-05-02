@@ -15,6 +15,46 @@ def _float_or_none(value: Any) -> float | None:
         return None
 
 
+def _nested_dict(payload: dict[str, Any], key: str) -> dict[str, Any] | None:
+    value = payload.get(key)
+    return value if isinstance(value, dict) else None
+
+
+def _find_numeric_price(payload: dict[str, Any]) -> float | None:
+    data = _nested_dict(payload, "data")
+    candidates = [
+        payload.get("value"),
+        payload.get("price"),
+        payload.get("last"),
+        payload.get("mark"),
+        payload.get("mid"),
+        data.get("value") if data else None,
+        data.get("price") if data else None,
+        data.get("last") if data else None,
+    ]
+    for candidate in candidates:
+        price = _float_or_none(candidate)
+        if price is not None:
+            return price
+    return None
+
+
+def _find_symbol(payload: dict[str, Any], fallback: str) -> str:
+    data = _nested_dict(payload, "data")
+    candidates = [
+        payload.get("symbol"),
+        payload.get("asset"),
+        payload.get("ticker"),
+        data.get("symbol") if data else None,
+        data.get("asset") if data else None,
+        data.get("ticker") if data else None,
+    ]
+    for candidate in candidates:
+        if candidate:
+            return str(candidate).lower()
+    return fallback.lower()
+
+
 def _coinbase_symbol(product_id: str) -> str:
     return product_id.replace("-", "").lower().replace("usd", "usdt")
 
@@ -40,11 +80,10 @@ def price_reading_from_event(event: DataEvent) -> PriceReading | None:
         return PriceReading("binance", event.key.lower(), (bid + ask) / 2.0, event.received_ts_ms, event.latency_ms)
 
     if event.event_type == EventType.RTDS_CRYPTO_PRICE:
-        raw_price = payload.get("value") or payload.get("price") or payload.get("last")
-        price = _float_or_none(raw_price)
+        price = _find_numeric_price(payload)
         if price is None:
             return None
-        return PriceReading("polymarket_rtds", event.key.lower(), price, event.received_ts_ms, event.latency_ms)
+        return PriceReading("polymarket_rtds", _find_symbol(payload, event.key), price, event.received_ts_ms, event.latency_ms)
 
     if event.event_type == EventType.COINBASE_TICKER:
         product_id = str(payload.get("product_id") or event.key)

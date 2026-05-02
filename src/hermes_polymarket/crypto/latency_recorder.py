@@ -15,6 +15,7 @@ from hermes_polymarket.signals.crypto_latency_detector import detect_external_mo
 from hermes_polymarket.signals.source_consensus import consensus_price
 from hermes_polymarket.storage.crypto_latency import insert_crypto_consensus_tick, insert_crypto_latency_event
 from hermes_polymarket.storage.db import Database
+from hermes_polymarket.storage.raw_samples import insert_raw_sample
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class RecorderConfig:
     cooldown_ms: int = 5000
     max_events: int = 500
     diagnostic_thresholds_pct: tuple[float, ...] = (0.03, 0.05, 0.08, 0.12)
+    raw_sample_limit_per_source: int = 20
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,7 @@ async def run_crypto_latency_recorder(
     consensus_count = 0
     latency_count = 0
     symbols = {symbol.lower() for symbol in config.symbols}
+    raw_samples_by_source: dict[str, int] = {}
 
     while time() - start < config.seconds:
         try:
@@ -66,6 +69,11 @@ async def run_crypto_latency_recorder(
 
         seen += 1
         diagnostics.seen_event(event.source)
+        if event.source == "polymarket_rtds":
+            current_samples = raw_samples_by_source.get(event.source, 0)
+            if current_samples < config.raw_sample_limit_per_source:
+                insert_raw_sample(db, event)
+                raw_samples_by_source[event.source] = current_samples + 1
         db.insert_data_event(event)
         db.upsert_source_health(event, dropped_events=bus.dropped_events)
         if event.event_type == EventType.SOURCE_HEALTH and event.payload.get("ok") is False:

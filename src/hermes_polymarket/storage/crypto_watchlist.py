@@ -53,6 +53,12 @@ def crypto_market_watchlist(db: Database, *, active_only: bool = True, limit: in
     return [dict(row) for row in rows]
 
 
+def clear_crypto_market_watchlist(db: Database) -> int:
+    cur = db.conn.execute("DELETE FROM crypto_market_watchlist")
+    db.conn.commit()
+    return int(cur.rowcount)
+
+
 def watchlist_token_ids(db: Database, *, active_only: bool = True, limit: int = 100) -> tuple[str, ...]:
     token_ids: list[str] = []
     for row in crypto_market_watchlist(db, active_only=active_only, limit=limit):

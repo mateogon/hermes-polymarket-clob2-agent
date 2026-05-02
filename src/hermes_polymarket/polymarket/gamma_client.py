@@ -22,8 +22,17 @@ class GammaClient:
         data = response.json()
         return data if isinstance(data, list) else []
 
+    def list_events(self, **params: Any) -> list[dict[str, Any]]:
+        response = self._http.get(f"{GAMMA_BASE}/events", params=params)
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else []
+
     def search_markets(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         return self.list_markets(_q=query, limit=limit, active="true", closed="false")
+
+    def search_events(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+        return self.list_events(q=query, limit=limit, active="true", closed="false")
 
     def active_markets(self, limit: int = 50) -> list[dict[str, Any]]:
         return self.list_markets(limit=limit, active="true", closed="false")

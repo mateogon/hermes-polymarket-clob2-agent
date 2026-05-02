@@ -1,4 +1,4 @@
-from hermes_polymarket.storage.crypto_watchlist import crypto_market_watchlist, upsert_crypto_market_watchlist, watchlist_token_ids
+from hermes_polymarket.storage.crypto_watchlist import clear_crypto_market_watchlist, crypto_market_watchlist, upsert_crypto_market_watchlist, watchlist_token_ids
 from hermes_polymarket.storage.db import Database
 
 
@@ -25,4 +25,6 @@ def test_crypto_watchlist_roundtrip(tmp_path):
     assert len(rows) == 1
     assert rows[0]["symbol"] == "btcusdt"
     assert watchlist_token_ids(db) == ("yes", "no")
+    assert clear_crypto_market_watchlist(db) == 1
+    assert crypto_market_watchlist(db) == []
     db.close()
