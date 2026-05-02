@@ -1554,6 +1554,18 @@ def cmd_crypto_paper_readiness(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_crypto_paper_campaign_summary(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.campaign_summary import summarize_campaign_dbs
+
+    result = summarize_campaign_dbs(args.db, include_fixture=args.include_fixture, include_signals=args.include_signals)
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_l2_recorder_start(args: argparse.Namespace) -> int:
     from hermes_polymarket.crypto.l2_recorder import run_l2_recorder
     from hermes_polymarket.data_sources.base import DataEvent, EventType, now_ms
@@ -2041,6 +2053,12 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_readiness.add_argument("--min-signals", type=int, default=30)
     crypto_paper_readiness.add_argument("--min-positions", type=int, default=5)
     crypto_paper_readiness.set_defaults(func=cmd_crypto_paper_readiness)
+    crypto_paper_campaign_summary = crypto_paper_sub.add_parser("campaign-summary")
+    crypto_paper_campaign_summary.add_argument("--db", action="append", required=True)
+    crypto_paper_campaign_summary.add_argument("--output", default=None)
+    crypto_paper_campaign_summary.add_argument("--include-fixture", action="store_true")
+    crypto_paper_campaign_summary.add_argument("--include-signals", action="store_true")
+    crypto_paper_campaign_summary.set_defaults(func=cmd_crypto_paper_campaign_summary)
 
     l2 = sub.add_parser("l2-recorder")
     l2_sub = l2.add_subparsers(dest="l2_command", required=True)

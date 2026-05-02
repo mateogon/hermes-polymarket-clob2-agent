@@ -60,3 +60,27 @@ def test_readiness_true_with_enough_real_signals(tmp_path):
 
     assert report["signals_real"] == 3
     assert report["ready_for_arena"] is True
+
+
+def test_readiness_v2_allows_diagnostic_arena_with_positions(tmp_path):
+    db = _db(tmp_path)
+    for idx in range(5):
+        db.conn.execute(
+            """
+            INSERT INTO forward_paper_positions
+              (position_id, signal_id, run_id, symbol, condition_id, token_id, outcome,
+               entry_ts_ms, entry_price, shares, amount_usd, status, exit_ts_ms,
+               exit_price, exit_reason, gross_pnl, net_pnl, fixture)
+            VALUES (?, ?, 'run', 'btcusdt', 'c', 't', 'YES', 1, 0.5, 10, 5,
+                    'closed', 2, 0.6, 'take_profit', 0.1, 0.1, 0)
+            """,
+            (f"pos-{idx}", f"sig-{idx}"),
+        )
+    db.conn.commit()
+
+    report = forward_paper_readiness(db)
+
+    assert report["ready_for_diagnostic_arena"] is True
+    assert report["ready_for_strategy_claim"] is False
+    assert report["ready_for_live_review"] is False
+    assert "small_signal_sample" in report["warnings"]
