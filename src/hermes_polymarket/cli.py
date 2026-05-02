@@ -916,6 +916,7 @@ def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
     from hermes_polymarket.storage.crypto_watchlist import (
         clear_crypto_market_watchlist,
         crypto_market_watchlist,
+        set_crypto_market_reference,
         set_crypto_market_watchlist_active,
         upsert_crypto_market_watchlist,
     )
@@ -1033,6 +1034,34 @@ def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
                     sort_keys=True,
                 )
             )
+        elif args.watchlist_action == "set-reference":
+            updated = set_crypto_market_reference(
+                db,
+                condition_id=args.condition_id,
+                reference_price=args.reference_price,
+                window_start_ts=args.window_start_ts,
+                window_end_ts=args.window_end_ts,
+            )
+            print(
+                json.dumps(
+                    {
+                        "mode": "measurement_paper_only",
+                        "status": "reference_updated",
+                        "condition_id": args.condition_id,
+                        "updated": updated,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        elif args.watchlist_action == "score":
+            from hermes_polymarket.crypto.market_score import score_watchlist_markets
+
+            print(json.dumps(score_watchlist_markets(db, symbol=args.symbol, limit=args.limit), indent=2, sort_keys=True))
+        elif args.watchlist_action == "best":
+            from hermes_polymarket.crypto.market_score import best_watchlist_markets
+
+            print(json.dumps(best_watchlist_markets(db, symbol=args.symbol, limit=args.limit), indent=2, sort_keys=True))
         else:
             rows = crypto_market_watchlist(db, active_only=not args.all, limit=args.limit)
             print(json.dumps({"mode": "measurement_paper_only", "watchlist": rows}, indent=2, sort_keys=True))
@@ -1191,7 +1220,22 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
             return 2
         seconds = max(1, min(args.seconds, 900))
         watchlist = crypto_market_watchlist(db, active_only=True, limit=args.max_watchlist_markets) if args.from_watchlist else []
+        if args.best_markets_only and watchlist:
+            from hermes_polymarket.crypto.market_score import best_watchlist_markets
+
+            best = best_watchlist_markets(db, limit=args.max_watchlist_markets)
+            keep = {row["condition_id"] for row in best["markets"] if row.get("recommended_action") == "keep_market"}
+            watchlist = [row for row in watchlist if row["condition_id"] in keep]
         token_ids = watchlist_token_ids(db, active_only=True, limit=args.max_watchlist_markets) if args.from_watchlist else ()
+        if args.best_markets_only:
+            token_ids = tuple(
+                dict.fromkeys(
+                    token_id
+                    for row in watchlist
+                    for token_id in (str(row["yes_token_id"]), str(row["no_token_id"]))
+                    if token_id
+                )
+            )
         if args.fixture and not watchlist:
             watchlist = [
                 {
@@ -1319,6 +1363,11 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                         timeout_seconds=args.timeout_seconds,
                         fixture=args.fixture,
                         healthy_only=args.healthy_only,
+                        use_stale_quote_gate=args.use_stale_quote_gate,
+                        stale_quote_max_reprice_cents=args.stale_quote_max_reprice_cents,
+                        stale_quote_window_ms=args.stale_quote_window_ms,
+                        use_fair_value=args.use_fair_value,
+                        fair_value_min_edge=args.fair_value_min_edge,
                     ),
                     watchlist=watchlist,
                     settings=settings,
@@ -1373,6 +1422,9 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                     "min_strategy_threshold_pct": args.min_strategy_threshold_pct,
                     "threshold_grid": args.threshold_grid,
                     "healthy_only": args.healthy_only,
+                    "use_stale_quote_gate": args.use_stale_quote_gate,
+                    "use_fair_value": args.use_fair_value,
+                    "fair_value_min_edge": args.fair_value_min_edge,
                 },
                 summary=summary_dict,
                 report=position_report,
@@ -1562,6 +1614,36 @@ def cmd_crypto_paper_campaign_summary(args: argparse.Namespace) -> int:
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_crypto_paper_loss_attribution(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.loss_attribution import expand_db_globs, loss_attribution, write_loss_attribution
+
+    db_paths = expand_db_globs(args.db_glob)
+    result = loss_attribution(db_paths, include_fixture=args.include_fixture)
+    if args.output:
+        output = write_loss_attribution(result, args.output)
+        result = {**result, "artifact": str(output)}
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_crypto_paper_shadow_exits(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.shadow_exit_replay import expand_db_globs, shadow_exit_grid, write_shadow_exit_grid
+
+    db_paths = expand_db_globs(args.db_glob)
+    result = shadow_exit_grid(
+        db_paths,
+        take_profit_cents=[float(value) for value in args.take_profit_cents.split(",") if value.strip()],
+        stop_loss_cents=[float(value) for value in args.stop_loss_cents.split(",") if value.strip()],
+        timeout_seconds=[int(value) for value in args.timeout_seconds.split(",") if value.strip()],
+        include_fixture=args.include_fixture,
+    )
+    if args.output:
+        output = write_shadow_exit_grid(result, args.output)
+        result = {**result, "artifact": str(output)}
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
@@ -2018,6 +2100,16 @@ def build_parser() -> argparse.ArgumentParser:
     watchlist_prune = watchlist_sub.add_parser("prune-bad")
     watchlist_prune.add_argument("--symbol", default=None)
     watchlist_prune.add_argument("--dry-run", action="store_true")
+    watchlist_reference = watchlist_sub.add_parser("set-reference")
+    watchlist_reference.add_argument("--condition-id", required=True)
+    watchlist_reference.add_argument("--reference-price", type=float, required=True)
+    watchlist_reference.add_argument("--window-start-ts", type=int, default=None)
+    watchlist_reference.add_argument("--window-end-ts", type=int, default=None)
+    watchlist_score = watchlist_sub.add_parser("score")
+    watchlist_score.add_argument("--symbol", default=None)
+    watchlist_best = watchlist_sub.add_parser("best")
+    watchlist_best.add_argument("--symbol", default=None)
+    watchlist_best.add_argument("--limit", type=int, default=5)
     crypto_watchlist.set_defaults(func=cmd_crypto_latency_watchlist)
     crypto_health = crypto_sub.add_parser("source-health")
     crypto_health.set_defaults(func=cmd_crypto_latency_source_health)
@@ -2072,6 +2164,12 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_watch.add_argument("--timeout-seconds", type=int, default=900)
     crypto_paper_watch.add_argument("--disable-rtds", action="store_true")
     crypto_paper_watch.add_argument("--fixture", action="store_true")
+    crypto_paper_watch.add_argument("--best-markets-only", action="store_true", help="Accepted for campaign-v2 protocol; use watchlist best/score before running.")
+    crypto_paper_watch.add_argument("--use-stale-quote-gate", action="store_true")
+    crypto_paper_watch.add_argument("--stale-quote-max-reprice-cents", type=float, default=1.0)
+    crypto_paper_watch.add_argument("--stale-quote-window-ms", type=int, default=1500)
+    crypto_paper_watch.add_argument("--use-fair-value", action="store_true")
+    crypto_paper_watch.add_argument("--fair-value-min-edge", type=float, default=0.03)
     crypto_paper_watch.add_argument(
         "--healthy-only",
         action="store_true",
@@ -2128,6 +2226,19 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_campaign_summary.add_argument("--include-fixture", action="store_true")
     crypto_paper_campaign_summary.add_argument("--include-signals", action="store_true")
     crypto_paper_campaign_summary.set_defaults(func=cmd_crypto_paper_campaign_summary)
+    crypto_paper_loss = crypto_paper_sub.add_parser("loss-attribution")
+    crypto_paper_loss.add_argument("--db-glob", action="append", required=True)
+    crypto_paper_loss.add_argument("--output", default="artifacts/evidence/loss_attribution.json")
+    crypto_paper_loss.add_argument("--include-fixture", action="store_true")
+    crypto_paper_loss.set_defaults(func=cmd_crypto_paper_loss_attribution)
+    crypto_paper_shadow = crypto_paper_sub.add_parser("shadow-exits")
+    crypto_paper_shadow.add_argument("--db-glob", action="append", required=True)
+    crypto_paper_shadow.add_argument("--output", default="artifacts/evidence/shadow_exits.json")
+    crypto_paper_shadow.add_argument("--include-fixture", action="store_true")
+    crypto_paper_shadow.add_argument("--take-profit-cents", default="3,5,8,12")
+    crypto_paper_shadow.add_argument("--stop-loss-cents", default="2,4,6")
+    crypto_paper_shadow.add_argument("--timeout-seconds", default="60,120,300,900")
+    crypto_paper_shadow.set_defaults(func=cmd_crypto_paper_shadow_exits)
 
     strategy_arena = sub.add_parser("strategy-arena")
     strategy_arena_sub = strategy_arena.add_subparsers(dest="strategy_arena_command", required=True)

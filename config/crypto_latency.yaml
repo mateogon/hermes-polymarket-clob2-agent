@@ -42,6 +42,22 @@ paper_opportunity:
     - 2000
     - 5000
 
+stale_quote:
+  enabled: true
+  max_reprice_cents: 1.0
+  stale_window_ms: 1500
+  require_bbo_before: true
+  require_bbo_after: true
+  reject_if_already_repriced: true
+
+fair_value:
+  enabled: true
+  min_edge: 0.03
+  max_probability: 0.90
+  min_probability: 0.10
+  distance_scale_pct: 0.25
+  time_decay_enabled: true
+
 recording:
   default_seconds: 300
   artifact_dir: artifacts/crypto_latency

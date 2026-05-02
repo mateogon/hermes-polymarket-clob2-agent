@@ -16,8 +16,10 @@ from uuid import uuid4
 from hermes_polymarket.config import Settings, load_settings
 from hermes_polymarket.crypto.directional_mapping import DirectionalToken, desired_direction_from_move, select_directional_token
 from hermes_polymarket.crypto.event_adapter import price_reading_from_event
+from hermes_polymarket.crypto.fair_value import evaluate_fair_value_edge
 from hermes_polymarket.crypto.market_quality import MarketQualityDecision, evaluate_market_quality
 from hermes_polymarket.crypto.runtime_state import CryptoRuntimeState
+from hermes_polymarket.crypto.stale_quote_gate import evaluate_stale_quote
 from hermes_polymarket.data_sources.base import DataEvent, EventType
 from hermes_polymarket.data_sources.event_bus import EventBus
 from hermes_polymarket.forward_paper.calibration import ThresholdCalibration
@@ -43,7 +45,7 @@ from hermes_polymarket.storage.crypto_latency import (
     insert_crypto_latency_event,
     insert_crypto_latency_opportunity,
 )
-from hermes_polymarket.storage.crypto_watchlist import crypto_market_watchlist
+from hermes_polymarket.storage.crypto_watchlist import crypto_market_watchlist, watchlist_reference
 from hermes_polymarket.storage.db import Database
 from hermes_polymarket.storage.forward_positions import insert_forward_mark, insert_forward_signal, upsert_forward_position
 from hermes_polymarket.storage.l2 import persist_l2_event
@@ -67,6 +69,11 @@ class PaperWatcherConfig:
     max_events: int = 500
     fixture: bool = False
     healthy_only: bool = False
+    use_stale_quote_gate: bool = False
+    stale_quote_max_reprice_cents: float = 1.0
+    stale_quote_window_ms: int = 1500
+    use_fair_value: bool = False
+    fair_value_min_edge: float = 0.03
 
 
 @dataclass(frozen=True)
@@ -383,6 +390,71 @@ def _record_market_quality_rejection(
     )
 
 
+def _record_gate_rejection(
+    db: Database,
+    *,
+    run_id: str,
+    event_id: str,
+    token_id: str,
+    market: dict[str, Any],
+    direction: str,
+    external_move_ts_ms: int,
+    external_move_pct: float,
+    amount_usd: float,
+    model_probability: float,
+    threshold_pct: float,
+    source_consensus: dict[str, Any],
+    final_action: str,
+    reason: str,
+    gate_payload: dict[str, Any],
+    fixture: bool,
+) -> None:
+    payload = {
+        "mode": "forward_paper_watcher",
+        "threshold_pct": threshold_pct,
+        "external_move_pct": external_move_pct,
+        "selected_direction": direction,
+        "selected_token_id": token_id,
+        "direction_mapping_source": "watchlist",
+        "model_probability_raw": model_probability,
+        "condition_id": market.get("condition_id"),
+        "slug": market.get("slug"),
+        "symbol": market.get("symbol"),
+        "direction": direction,
+        "external_move_ts_ms": external_move_ts_ms,
+        "risk_allowed": False,
+        "risk_reason": reason,
+        "source_consensus": source_consensus,
+        **gate_payload,
+    }
+    insert_forward_signal(
+        db,
+        {
+            "signal_id": event_id,
+            "run_id": run_id,
+            "symbol": str(market.get("symbol") or ""),
+            "condition_id": str(market.get("condition_id") or ""),
+            "token_id": token_id,
+            "outcome": str(market.get("outcome") or ""),
+            "direction": direction,
+            "external_move_ts_ms": external_move_ts_ms,
+            "external_move_pct": external_move_pct,
+            "final_action": final_action,
+            "risk_reason": reason,
+            "fill_status": None,
+            "best_bid": None,
+            "best_ask": None,
+            "spread": None,
+            "avg_price": None,
+            "shares": None,
+            "amount_usd": amount_usd,
+            "model_probability": model_probability,
+            "fixture": fixture,
+            "payload": payload,
+        },
+    )
+
+
 def _mark_open_positions(
     db: Database,
     *,
@@ -612,6 +684,78 @@ async def run_crypto_paper_watcher(
                 )
                 risk_rejected += 1
                 continue
+            if config.use_stale_quote_gate:
+                current_bbo = {"best_bid": quality.best_bid, "best_ask": quality.best_ask}
+                stale = evaluate_stale_quote(
+                    external_move_pct=signal.external_move_pct,
+                    bbo_before=current_bbo,
+                    bbo_after=current_bbo,
+                    max_reprice_cents=config.stale_quote_max_reprice_cents,
+                    stale_window_ms=config.stale_quote_window_ms,
+                    require_bbo_before=True,
+                    require_bbo_after=True,
+                )
+                if not stale.allowed:
+                    _record_gate_rejection(
+                        db,
+                        run_id=run_id,
+                        event_id=signal.event_id,
+                        token_id=selected.token_id,
+                        market=market,
+                        direction=selected.direction,
+                        external_move_ts_ms=signal.detected_ts_ms,
+                        external_move_pct=signal.external_move_pct,
+                        amount_usd=config.amount_usd,
+                        model_probability=config.model_probability,
+                        threshold_pct=config.min_move_pct,
+                        source_consensus={"sources": list(current.sources), "max_deviation_pct": current.max_deviation_pct},
+                        final_action="stale_quote_rejected",
+                        reason=stale.reason,
+                        gate_payload={"stale_quote": stale.to_dict()},
+                        fixture=config.fixture,
+                    )
+                    risk_rejected += 1
+                    continue
+            if config.use_fair_value:
+                ref = watchlist_reference(market)
+                reference_price = ref.get("reference_price")
+                window_end_ts = ref.get("window_end_ts")
+                if reference_price is None or window_end_ts is None or quality.best_ask is None:
+                    reason = "fair_value_missing_reference"
+                    payload = {"fair_value": {"allowed": False, "reason": reason, "reference": ref}}
+                else:
+                    seconds_to_expiry = max(1.0, float(window_end_ts) - signal.detected_ts_ms / 1000.0)
+                    fair = evaluate_fair_value_edge(
+                        direction=selected.direction,
+                        current_price=signal.current_price,
+                        reference_price=float(reference_price),
+                        seconds_to_expiry=seconds_to_expiry,
+                        executable_price=float(quality.best_ask),
+                        min_edge=config.fair_value_min_edge,
+                    )
+                    reason = fair.reason
+                    payload = {"fair_value": fair.to_dict()}
+                if reason != "fair_value_edge":
+                    _record_gate_rejection(
+                        db,
+                        run_id=run_id,
+                        event_id=signal.event_id,
+                        token_id=selected.token_id,
+                        market=market,
+                        direction=selected.direction,
+                        external_move_ts_ms=signal.detected_ts_ms,
+                        external_move_pct=signal.external_move_pct,
+                        amount_usd=config.amount_usd,
+                        model_probability=config.model_probability,
+                        threshold_pct=config.min_move_pct,
+                        source_consensus={"sources": list(current.sources), "max_deviation_pct": current.max_deviation_pct},
+                        final_action="fair_value_rejected",
+                        reason=reason,
+                        gate_payload=payload,
+                        fixture=config.fixture,
+                    )
+                    risk_rejected += 1
+                    continue
             opp_delta, fill_delta, reject_delta, position = _record_token_opportunity(
                 db,
                 run_id=run_id,

@@ -77,6 +77,44 @@ def set_crypto_market_watchlist_active(db: Database, *, condition_id: str, activ
     return int(cur.rowcount)
 
 
+def set_crypto_market_reference(
+    db: Database,
+    *,
+    condition_id: str,
+    reference_price: float,
+    window_start_ts: int | None = None,
+    window_end_ts: int | None = None,
+) -> int:
+    rows = db.conn.execute("SELECT id, raw_json FROM crypto_market_watchlist WHERE condition_id = ?", (condition_id,)).fetchall()
+    updated = 0
+    for row in rows:
+        try:
+            raw = json.loads(row["raw_json"] or "{}")
+        except json.JSONDecodeError:
+            raw = {}
+        raw["reference_price"] = reference_price
+        if window_start_ts is not None:
+            raw["window_start_ts"] = window_start_ts
+        if window_end_ts is not None:
+            raw["window_end_ts"] = window_end_ts
+        db.conn.execute("UPDATE crypto_market_watchlist SET raw_json = ? WHERE id = ?", (json.dumps(raw, sort_keys=True), row["id"]))
+        updated += 1
+    db.conn.commit()
+    return updated
+
+
+def watchlist_reference(row: dict[str, Any]) -> dict[str, Any]:
+    try:
+        raw = json.loads(row.get("raw_json") or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    return {
+        "reference_price": raw.get("reference_price"),
+        "window_start_ts": raw.get("window_start_ts"),
+        "window_end_ts": raw.get("window_end_ts") or row.get("end_ts_ms"),
+    }
+
+
 def watchlist_token_ids(db: Database, *, active_only: bool = True, limit: int = 100) -> tuple[str, ...]:
     token_ids: list[str] = []
     for row in crypto_market_watchlist(db, active_only=active_only, limit=limit):
