@@ -1068,6 +1068,147 @@ def cmd_crypto_latency_opportunities(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
+    from hermes_polymarket.crypto.paper_watcher import PaperWatcherConfig, run_crypto_paper_watcher
+    from hermes_polymarket.data_sources.base import DataEvent, EventType, now_ms
+    from hermes_polymarket.data_sources.event_bus import EventBus
+    from hermes_polymarket.storage.crypto_latency import crypto_latency_report
+    from hermes_polymarket.storage.crypto_watchlist import crypto_market_watchlist, watchlist_token_ids
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        symbols = tuple(symbol.strip().lower() for symbol in args.symbols.split(",") if symbol.strip())
+        if not symbols:
+            print("crypto-paper watch requires at least one symbol")
+            return 2
+        if not args.from_watchlist:
+            print("crypto-paper watch requires --from-watchlist so paper fills use known Polymarket token IDs.")
+            return 2
+        seconds = max(1, min(args.seconds, 900))
+        watchlist = crypto_market_watchlist(db, active_only=True, limit=args.max_watchlist_markets) if args.from_watchlist else []
+        token_ids = watchlist_token_ids(db, active_only=True, limit=args.max_watchlist_markets) if args.from_watchlist else ()
+        if args.from_watchlist and not token_ids:
+            print("No token IDs found. Run crypto-latency discover or crypto-latency watchlist add first.")
+            return 2
+
+        async def publish_fixture(bus: EventBus) -> None:
+            ts = now_ms()
+            for market in watchlist:
+                for token_id in (str(market["yes_token_id"]), str(market["no_token_id"])):
+                    await bus.publish(
+                        DataEvent(
+                            source="fixture_market_ws",
+                            event_type=EventType.POLY_BOOK,
+                            event_ts_ms=ts,
+                            received_ts_ms=ts,
+                            key=token_id,
+                            payload={
+                                "asset_id": token_id,
+                                "market": market["condition_id"],
+                                "bids": [{"price": "0.49", "size": "100"}],
+                                "asks": [{"price": "0.51", "size": "100"}],
+                            },
+                        )
+                    )
+                    await bus.publish(
+                        DataEvent(
+                            source="fixture_market_ws",
+                            event_type=EventType.POLY_BEST_BID_ASK,
+                            event_ts_ms=ts + 10,
+                            received_ts_ms=ts + 10,
+                            key=token_id,
+                            payload={"asset_id": token_id, "market": market["condition_id"], "best_bid": "0.49", "best_ask": "0.51"},
+                        )
+                    )
+            symbol = symbols[0]
+            coinbase_key = symbol.replace("usdt", "-USD").upper()
+            for price in (100.0, 100.02, 101.0):
+                await bus.publish(
+                    DataEvent(
+                        source="fixture_binance",
+                        event_type=EventType.BINANCE_TRADE,
+                        event_ts_ms=ts,
+                        received_ts_ms=ts,
+                        key=symbol,
+                        payload={"symbol": symbol.upper(), "price": price, "qty": 1.0},
+                    )
+                )
+                await bus.publish(
+                    DataEvent(
+                        source="fixture_coinbase",
+                        event_type=EventType.COINBASE_TICKER,
+                        event_ts_ms=None,
+                        received_ts_ms=ts,
+                        key=coinbase_key.lower(),
+                        payload={"product_id": coinbase_key, "price": price},
+                    )
+                )
+                ts += 1000
+
+        async def run() -> dict[str, Any]:
+            bus = EventBus()
+            tasks: list[asyncio.Task[None]] = []
+            if args.fixture:
+                await publish_fixture(bus)
+            else:
+                from hermes_polymarket.data_sources.binance_stream import run_binance_stream
+                from hermes_polymarket.data_sources.coinbase_stream import run_coinbase_ticker
+                from hermes_polymarket.data_sources.kraken_stream import run_kraken_ticker
+                from hermes_polymarket.data_sources.polymarket_market_ws import run_polymarket_market_ws
+
+                coinbase_products = tuple(symbol.replace("usdt", "-USD").upper() for symbol in symbols)
+                kraken_symbols = tuple(symbol.replace("usdt", "/USD").upper() for symbol in symbols)
+                tasks = [
+                    asyncio.create_task(run_binance_stream(bus, symbols=symbols)),
+                    asyncio.create_task(run_coinbase_ticker(bus, product_ids=coinbase_products)),
+                    asyncio.create_task(run_kraken_ticker(bus, symbols=kraken_symbols)),
+                    asyncio.create_task(run_polymarket_market_ws(bus, asset_ids=token_ids)),
+                ]
+                if not args.disable_rtds:
+                    from hermes_polymarket.data_sources.polymarket_rtds import run_polymarket_rtds_crypto
+
+                    tasks.append(asyncio.create_task(run_polymarket_rtds_crypto(bus, symbols=symbols)))
+            try:
+                summary = await run_crypto_paper_watcher(
+                    db=db,
+                    bus=bus,
+                    config=PaperWatcherConfig(
+                        symbols=symbols,
+                        seconds=seconds,
+                        amount_usd=args.amount,
+                        min_move_pct=args.min_move_pct,
+                        max_age_ms=args.max_age_ms,
+                        max_deviation_pct=args.max_deviation_pct,
+                        min_sources=args.min_sources,
+                        cooldown_ms=args.cooldown_ms,
+                    ),
+                    watchlist=watchlist,
+                )
+            finally:
+                for task in tasks:
+                    task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.gather(*tasks)
+
+            return {
+                "mode": "forward_paper_only",
+                "data_quality": "paper_live" if not args.fixture else "local_observation",
+                "fixture": args.fixture,
+                "symbols": symbols,
+                "from_watchlist": args.from_watchlist,
+                "watchlist_token_count": len(token_ids),
+                "summary": summary.to_dict(),
+                "report": crypto_latency_report(db),
+            }
+
+        print(json.dumps(asyncio.run(run()), indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
 def cmd_l2_recorder_start(args: argparse.Namespace) -> int:
     from hermes_polymarket.crypto.l2_recorder import run_l2_recorder
     from hermes_polymarket.data_sources.base import DataEvent, EventType, now_ms
@@ -1467,6 +1608,23 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_opps = crypto_sub.add_parser("opportunities")
     crypto_opps.add_argument("--limit", type=int, default=50)
     crypto_opps.set_defaults(func=cmd_crypto_latency_opportunities)
+
+    crypto_paper = sub.add_parser("crypto-paper")
+    crypto_paper_sub = crypto_paper.add_subparsers(dest="crypto_paper_command", required=True)
+    crypto_paper_watch = crypto_paper_sub.add_parser("watch")
+    crypto_paper_watch.add_argument("--seconds", type=int, default=300)
+    crypto_paper_watch.add_argument("--symbols", default="btcusdt,ethusdt,solusdt,xrpusdt")
+    crypto_paper_watch.add_argument("--from-watchlist", action="store_true")
+    crypto_paper_watch.add_argument("--max-watchlist-markets", type=int, default=20)
+    crypto_paper_watch.add_argument("--amount", type=float, default=5.0)
+    crypto_paper_watch.add_argument("--min-move-pct", type=float, default=0.03)
+    crypto_paper_watch.add_argument("--max-age-ms", type=int, default=2500)
+    crypto_paper_watch.add_argument("--max-deviation-pct", type=float, default=0.25)
+    crypto_paper_watch.add_argument("--min-sources", type=int, default=2)
+    crypto_paper_watch.add_argument("--cooldown-ms", type=int, default=5000)
+    crypto_paper_watch.add_argument("--disable-rtds", action="store_true")
+    crypto_paper_watch.add_argument("--fixture", action="store_true")
+    crypto_paper_watch.set_defaults(func=cmd_crypto_paper_watch)
 
     l2 = sub.add_parser("l2-recorder")
     l2_sub = l2.add_subparsers(dest="l2_command", required=True)
