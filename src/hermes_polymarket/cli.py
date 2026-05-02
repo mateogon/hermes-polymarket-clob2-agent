@@ -688,6 +688,65 @@ def cmd_learning_retire(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_crypto_latency_discover(_: argparse.Namespace) -> int:
+    from hermes_polymarket.storage.crypto_latency import crypto_latency_report
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        payload = crypto_latency_report(db)
+        payload["status"] = "discover_skeleton"
+        payload["message"] = "Crypto market discovery is measurement-only; no live trading or order posting is implemented."
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_latency_record(args: argparse.Namespace) -> int:
+    from hermes_polymarket.storage.crypto_latency import crypto_latency_report
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        payload = crypto_latency_report(db)
+        payload["status"] = "record_skeleton"
+        payload["seconds"] = args.seconds
+        payload["message"] = "Safe skeleton only: wire live public WS orchestration in a later local-L2 recorder step."
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_latency_report(_: argparse.Namespace) -> int:
+    from hermes_polymarket.storage.crypto_latency import crypto_latency_report
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        print(json.dumps(crypto_latency_report(db), indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_latency_opportunities(args: argparse.Namespace) -> int:
+    from hermes_polymarket.storage.crypto_latency import crypto_latency_opportunities
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        print(json.dumps({"mode": "measurement_paper_only", "opportunities": crypto_latency_opportunities(db, limit=args.limit)}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hermes-polymarket")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -795,6 +854,19 @@ def build_parser() -> argparse.ArgumentParser:
     retire.add_argument("--rule-id", required=True)
     retire.add_argument("--reason", default="retired by operator")
     retire.set_defaults(func=cmd_learning_retire)
+
+    crypto_latency = sub.add_parser("crypto-latency")
+    crypto_sub = crypto_latency.add_subparsers(dest="crypto_latency_command", required=True)
+    crypto_discover = crypto_sub.add_parser("discover")
+    crypto_discover.set_defaults(func=cmd_crypto_latency_discover)
+    crypto_record = crypto_sub.add_parser("record")
+    crypto_record.add_argument("--seconds", type=int, default=300)
+    crypto_record.set_defaults(func=cmd_crypto_latency_record)
+    crypto_report = crypto_sub.add_parser("report")
+    crypto_report.set_defaults(func=cmd_crypto_latency_report)
+    crypto_opps = crypto_sub.add_parser("opportunities")
+    crypto_opps.add_argument("--limit", type=int, default=50)
+    crypto_opps.set_defaults(func=cmd_crypto_latency_opportunities)
 
     dry = sub.add_parser("dry-run")
     dry.add_argument("--market", default=None, help="Market identifier: slug, condition ID, token ID, or search text")

@@ -47,3 +47,17 @@ def test_learning_and_wallet_research_do_not_import_live_executor():
         files = path.rglob("*.py") if path.is_dir() else [path]
         for file in files:
             assert "live_executor" not in file.read_text()
+
+
+def test_crypto_latency_modules_do_not_import_live_executor():
+    checked = [
+        ROOT / "src/hermes_polymarket/crypto",
+        ROOT / "src/hermes_polymarket/backtest/crypto_latency_opportunity.py",
+        ROOT / "src/hermes_polymarket/signals/crypto_latency_detector.py",
+        ROOT / "src/hermes_polymarket/signals/source_consensus.py",
+        ROOT / "src/hermes_polymarket/storage/crypto_latency.py",
+    ]
+    for path in checked:
+        files = path.rglob("*.py") if path.is_dir() else [path]
+        for file in files:
+            assert "live_executor" not in file.read_text()

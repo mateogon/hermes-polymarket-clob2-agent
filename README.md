@@ -89,6 +89,17 @@ If `leader_exit` replay produces zero closed trades, run `wallet-flow exit-cover
 
 Use `wallet-flow positions` to inspect public current and closed Data API positions. This is useful when a wallet appears to hold to resolution, redeem, or hedge with opposite assets instead of selling the same asset.
 
+Crypto latency measurement commands are measurement/paper-only:
+
+```bash
+.venv/bin/python -m hermes_polymarket.cli crypto-latency discover
+.venv/bin/python -m hermes_polymarket.cli crypto-latency record --seconds 300
+.venv/bin/python -m hermes_polymarket.cli crypto-latency report
+.venv/bin/python -m hermes_polymarket.cli crypto-latency opportunities
+```
+
+The first version stores consensus ticks, latency events, market windows, and paper opportunities. `record` is intentionally a safe skeleton until local L2 recorder orchestration is added.
+
 Live gate check, expected to refuse by default:
 
 ```bash

@@ -283,4 +283,68 @@ CREATE TABLE IF NOT EXISTS market_categories (
   category TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS crypto_market_windows (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  condition_id TEXT NOT NULL,
+  slug TEXT NOT NULL,
+  question TEXT,
+  symbol TEXT NOT NULL,
+  yes_token_id TEXT NOT NULL,
+  no_token_id TEXT NOT NULL,
+  window_start_ts INTEGER,
+  window_end_ts INTEGER,
+  reference_price REAL,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(condition_id, yes_token_id, no_token_id)
+);
+
+CREATE TABLE IF NOT EXISTS crypto_consensus_ticks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  symbol TEXT NOT NULL,
+  consensus_price REAL NOT NULL,
+  sources_json TEXT NOT NULL,
+  max_deviation_pct REAL NOT NULL,
+  received_ts_ms INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_crypto_consensus_symbol_ts
+ON crypto_consensus_ticks(symbol, received_ts_ms);
+
+CREATE TABLE IF NOT EXISTS crypto_latency_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL UNIQUE,
+  symbol TEXT NOT NULL,
+  condition_id TEXT,
+  external_move_pct REAL NOT NULL,
+  external_move_detected_ts_ms INTEGER NOT NULL,
+  polymarket_reprice_ts_ms INTEGER,
+  repricing_lag_ms INTEGER,
+  spread_before REAL,
+  depth_before_usd REAL,
+  stale_quote_depth_usd REAL,
+  source_health_json TEXT NOT NULL DEFAULT '{}',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS crypto_latency_opportunities (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  opportunity_id TEXT NOT NULL UNIQUE,
+  event_id TEXT NOT NULL,
+  token_id TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  side TEXT NOT NULL,
+  amount_usd REAL NOT NULL,
+  avg_price REAL,
+  shares REAL,
+  fill_status TEXT NOT NULL,
+  risk_allowed INTEGER NOT NULL,
+  risk_reason TEXT,
+  data_quality TEXT NOT NULL DEFAULT 'paper_live',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """

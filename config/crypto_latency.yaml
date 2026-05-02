@@ -1,0 +1,37 @@
+symbols:
+  - btcusdt
+  - ethusdt
+  - solusdt
+  - xrpusdt
+
+source_consensus:
+  min_sources: 2
+  max_age_ms: 2500
+  max_deviation_pct: 0.25
+
+movement:
+  min_move_pct: 0.08
+  lookback_ms: 3000
+  cooldown_ms: 5000
+
+polymarket:
+  max_spread_cents: 4.0
+  min_depth_usd: 25.0
+  min_seconds_to_expiry: 15
+  max_seconds_to_expiry: 900
+
+paper_opportunity:
+  amount_usd: 5.0
+  model_probability_floor: 0.52
+  model_probability_cap: 0.75
+  delays_ms:
+    - 0
+    - 250
+    - 500
+    - 1000
+    - 2000
+    - 5000
+
+recording:
+  default_seconds: 300
+  artifact_dir: artifacts/crypto_latency
