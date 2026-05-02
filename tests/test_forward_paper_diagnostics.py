@@ -117,3 +117,14 @@ def test_crypto_paper_explain_cli(tmp_path, monkeypatch, capsys):
 
     out = json.loads(capsys.readouterr().out)
     assert out["risk_reason"] == "max_slippage"
+
+
+def test_crypto_paper_watch_accepts_healthy_only(tmp_path, monkeypatch, capsys):
+    db_path = tmp_path / "healthy-only.sqlite3"
+    monkeypatch.setenv("HERMES_DATABASE_PATH", str(db_path))
+
+    assert main(["crypto-paper", "watch", "--seconds", "1", "--symbols", "ethusdt", "--fixture", "--healthy-only"]) == 0
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["healthy_only"] is True
+    assert out["summary"]["watchlist_token_count"] == 2

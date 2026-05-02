@@ -66,6 +66,7 @@ class PaperWatcherConfig:
     cooldown_ms: int = 5000
     max_events: int = 500
     fixture: bool = False
+    healthy_only: bool = False
 
 
 @dataclass(frozen=True)

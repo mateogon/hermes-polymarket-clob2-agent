@@ -1318,6 +1318,7 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                         stop_loss_cents=args.stop_loss_cents,
                         timeout_seconds=args.timeout_seconds,
                         fixture=args.fixture,
+                        healthy_only=args.healthy_only,
                     ),
                     watchlist=watchlist,
                     settings=settings,
@@ -1371,6 +1372,7 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                     "min_move_pct": args.min_move_pct,
                     "min_strategy_threshold_pct": args.min_strategy_threshold_pct,
                     "threshold_grid": args.threshold_grid,
+                    "healthy_only": args.healthy_only,
                 },
                 summary=summary_dict,
                 report=position_report,
@@ -1388,6 +1390,7 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                 "fixture": args.fixture,
                 "symbols": symbols,
                 "from_watchlist": args.from_watchlist,
+                "healthy_only": args.healthy_only,
                 "watchlist_token_count": len(token_ids),
                 "summary": summary_dict,
                 "position_report": position_report,
@@ -1988,6 +1991,11 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_watch.add_argument("--timeout-seconds", type=int, default=900)
     crypto_paper_watch.add_argument("--disable-rtds", action="store_true")
     crypto_paper_watch.add_argument("--fixture", action="store_true")
+    crypto_paper_watch.add_argument(
+        "--healthy-only",
+        action="store_true",
+        help="Label this forward-paper run as restricted to market-quality-gated opportunities.",
+    )
     crypto_paper_watch.set_defaults(func=cmd_crypto_paper_watch)
     crypto_paper_positions = crypto_paper_sub.add_parser("positions")
     crypto_paper_positions.add_argument("--open", action="store_true")
