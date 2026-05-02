@@ -28,11 +28,12 @@ from hermes_polymarket.forward_paper.lifecycle import (
     should_exit_position,
     update_excursions,
 )
+from hermes_polymarket.forward_paper.diagnostics import shadow_risk_diagnostics
 from hermes_polymarket.forward_paper.models import ForwardPaperSignal
 from hermes_polymarket.polymarket.orderbook import simulate_buy_fill
 from hermes_polymarket.polymarket.types import MarketMetadata, TokenInfo, TradeProposal
 from hermes_polymarket.risk.exposure import ExposureSnapshot
-from hermes_polymarket.risk.risk_manager import RiskManager
+from hermes_polymarket.risk.risk_manager import RiskManager, executable_depth_usd
 from hermes_polymarket.signals.crypto_latency_detector import detect_external_move
 from hermes_polymarket.signals.source_consensus import consensus_price
 from hermes_polymarket.state.orderbook_state import OrderBookState
@@ -162,21 +163,26 @@ def _record_token_opportunity(
     external_move_ts_ms: int,
     external_move_pct: float,
     model_probability: float,
+    threshold_pct: float,
+    source_consensus: dict[str, Any],
     settings: Settings,
     open_position_count: int,
     fixture: bool,
 ) -> tuple[int, int, int, ForwardPaperPosition | None]:
     state = book_state.by_token.get(token_id)
     fill = None
+    book = None
+    shadow_risk: dict[str, str] = {}
+    depth_within_slippage_usd = None
     if state is not None:
-        fill = simulate_buy_fill(state.as_orderbook(), amount_usd, order_type="fok")
+        book = state.as_orderbook()
+        fill = simulate_buy_fill(book, amount_usd, order_type="fok")
 
     filled = bool(fill and fill.filled)
     risk_allowed = False
     risk_reason = "no_executable_fill"
     risk_explanation = "No executable fill available"
-    if filled and state is not None and fill is not None:
-        book = state.as_orderbook()
+    if filled and state is not None and fill is not None and book is not None:
         proposal = TradeProposal(
             market_id=str(market["condition_id"]),
             condition_id=str(market["condition_id"]),
@@ -207,6 +213,17 @@ def _record_token_opportunity(
             risk_allowed = decision.allowed
             risk_reason = decision.reason
             risk_explanation = decision.explanation
+            depth_within_slippage_usd = executable_depth_usd(book, proposal.side, settings.max_slippage)
+            shadow_risk = shadow_risk_diagnostics(
+                settings=settings,
+                proposal=proposal,
+                book=book,
+                fill=fill,
+                exposure=ExposureSnapshot(bankroll=settings.initial_bankroll, open_positions=open_position_count),
+            )
+
+    midpoint = book.midpoint if book is not None else None
+    slippage = fill.slippage if fill is not None else None
 
     row = {
         "opportunity_id": f"paper_opp_{uuid4().hex[:12]}",
@@ -223,6 +240,14 @@ def _record_token_opportunity(
         "data_quality": "paper_live",
         "payload": {
             "mode": "forward_paper_watcher",
+            "threshold_pct": threshold_pct,
+            "external_move_pct": external_move_pct,
+            "selected_direction": direction,
+            "selected_token_id": token_id,
+            "direction_mapping_source": "watchlist",
+            "model_probability_raw": model_probability,
+            "confidence": 0.35,
+            "entry_price": fill.avg_price if fill else None,
             "condition_id": market.get("condition_id"),
             "slug": market.get("slug"),
             "symbol": market.get("symbol"),
@@ -230,8 +255,18 @@ def _record_token_opportunity(
             "external_move_ts_ms": external_move_ts_ms,
             "best_bid": state.best_bid if state else None,
             "best_ask": state.best_ask if state else None,
+            "midpoint": midpoint,
             "spread": state.spread if state else None,
+            "slippage": slippage,
+            "max_slippage": settings.max_slippage,
+            "min_edge": settings.min_edge,
+            "depth_within_slippage_usd": depth_within_slippage_usd,
+            "fill_status": fill.status if fill else "no_local_book_state",
+            "risk_allowed": risk_allowed,
+            "risk_reason": risk_reason,
             "risk_explanation": risk_explanation,
+            "source_consensus": source_consensus,
+            "shadow_risk": shadow_risk,
         },
     }
     insert_crypto_latency_opportunity(db, row)
@@ -258,7 +293,7 @@ def _record_token_opportunity(
             "amount_usd": amount_usd,
             "model_probability": model_probability,
             "fixture": fixture,
-            "payload": {"risk_explanation": risk_explanation},
+            "payload": row["payload"],
         },
     )
     signal = ForwardPaperSignal(
@@ -499,6 +534,8 @@ async def run_crypto_paper_watcher(
                 external_move_pct=signal.external_move_pct,
                 model_probability=config.model_probability,
                 settings=settings,
+                threshold_pct=config.min_move_pct,
+                source_consensus={"sources": list(current.sources), "max_deviation_pct": current.max_deviation_pct},
                 open_position_count=len(open_positions),
                 fixture=config.fixture,
             )

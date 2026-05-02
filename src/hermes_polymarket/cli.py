@@ -913,6 +913,10 @@ def cmd_crypto_latency_source_health(_: argparse.Namespace) -> int:
 def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
     from hermes_polymarket.data_sources.base import now_ms
     from hermes_polymarket.storage.crypto_watchlist import clear_crypto_market_watchlist, crypto_market_watchlist, upsert_crypto_market_watchlist
+    try:
+        import yaml
+    except Exception:  # pragma: no cover - dependency is expected in normal runtime
+        yaml = None
 
     settings = _settings()
     db = Database(settings.database_path)
@@ -946,6 +950,51 @@ def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
             )
             rows = crypto_market_watchlist(db, active_only=False, limit=args.limit)
             print(json.dumps({"mode": "measurement_paper_only", "status": "added", "watchlist": rows}, indent=2, sort_keys=True))
+        elif args.watchlist_action == "import":
+            if yaml is None:
+                print("pyyaml is required for watchlist import")
+                return 2
+            path = Path(args.file)
+            payload = yaml.safe_load(path.read_text()) or {}
+            markets = payload.get("markets") if isinstance(payload, dict) else None
+            if not isinstance(markets, list):
+                print("manual watchlist file must contain a markets list")
+                return 2
+            imported = 0
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                yes_token_id = str(market["yes_token_id"])
+                no_token_id = str(market["no_token_id"])
+                up_token_id = market.get("up_token_id")
+                down_token_id = market.get("down_token_id")
+                yes_direction = market.get("yes_direction")
+                if yes_direction == "up":
+                    up_token_id = up_token_id or yes_token_id
+                    down_token_id = down_token_id or no_token_id
+                elif yes_direction == "down":
+                    up_token_id = up_token_id or no_token_id
+                    down_token_id = down_token_id or yes_token_id
+                upsert_crypto_market_watchlist(
+                    db,
+                    {
+                        "condition_id": str(market["condition_id"]),
+                        "slug": str(market["slug"]),
+                        "question": str(market.get("question") or market["slug"]),
+                        "symbol": str(market["symbol"]).lower(),
+                        "yes_token_id": yes_token_id,
+                        "no_token_id": no_token_id,
+                        "up_token_id": up_token_id,
+                        "down_token_id": down_token_id,
+                        "direction_map": {"up": up_token_id, "down": down_token_id} if up_token_id and down_token_id else {},
+                        "active": bool(market.get("active", True)),
+                        "discovered_at_ms": int(market.get("discovered_at_ms") or now_ms()),
+                        "raw": {"manual_import": str(path)},
+                    },
+                )
+                imported += 1
+            rows = crypto_market_watchlist(db, active_only=False, limit=args.limit)
+            print(json.dumps({"mode": "measurement_paper_only", "status": "imported", "imported": imported, "watchlist": rows}, indent=2, sort_keys=True))
         elif args.watchlist_action == "clear":
             deleted = clear_crypto_market_watchlist(db)
             print(json.dumps({"mode": "measurement_paper_only", "status": "cleared", "deleted": deleted}, indent=2, sort_keys=True))
@@ -1365,8 +1414,49 @@ def cmd_crypto_paper_signals(args: argparse.Namespace) -> int:
     db = Database(settings.database_path)
     db.init_schema(settings.initial_bankroll)
     try:
-        rows = forward_signals(db, run_id=args.run_id, include_fixture=args.include_fixture, rejected_only=args.rejected_only, limit=args.last)
+        rows = forward_signals(
+            db,
+            run_id=args.run_id,
+            include_fixture=args.include_fixture,
+            rejected_only=args.rejected_only,
+            risk_reason=getattr(args, "reason", None),
+            limit=args.last,
+        )
         print(json.dumps({"mode": "forward_paper_only", "run_id": args.run_id, "signals": rows}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_paper_explain(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.diagnostics import explain_forward_signal
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        result = explain_forward_signal(db, args.signal_id, settings)
+        if not result.get("found"):
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 2
+        print(json.dumps(result, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_paper_l2_context(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.diagnostics import l2_context_for_signal, signal_by_id
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        signal = signal_by_id(db, args.signal_id)
+        if signal is None:
+            print(json.dumps({"signal_id": args.signal_id, "book_found": False, "reason": "signal_not_found"}, indent=2, sort_keys=True))
+            return 2
+        print(json.dumps(l2_context_for_signal(db, signal, levels=args.levels), indent=2, sort_keys=True))
     finally:
         db.close()
     return 0
@@ -1397,6 +1487,30 @@ def cmd_crypto_paper_artifacts(args: argparse.Namespace) -> int:
             print(f"No forward paper run found for {args.run_id}")
             return 2
         print(json.dumps({"mode": "forward_paper_only", "run_id": args.run_id, "artifacts": json.loads(row["artifacts_json"])}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_paper_readiness(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.readiness import forward_paper_readiness
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        print(
+            json.dumps(
+                forward_paper_readiness(
+                    db,
+                    include_fixture=args.include_fixture,
+                    min_signals=args.min_signals,
+                    min_positions=args.min_positions,
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
     finally:
         db.close()
     return 0
@@ -1774,6 +1888,8 @@ def build_parser() -> argparse.ArgumentParser:
     watchlist_add.add_argument("--yes-direction", choices=["up", "down"], default=None)
     watchlist_add.add_argument("--question", default=None)
     watchlist_clear = watchlist_sub.add_parser("clear")
+    watchlist_import = watchlist_sub.add_parser("import")
+    watchlist_import.add_argument("--file", required=True)
     crypto_watchlist.set_defaults(func=cmd_crypto_latency_watchlist)
     crypto_health = crypto_sub.add_parser("source-health")
     crypto_health.set_defaults(func=cmd_crypto_latency_source_health)
@@ -1851,8 +1967,16 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_rejected.add_argument("--run-id", default=None)
     crypto_paper_rejected.add_argument("--last", type=int, default=50)
     crypto_paper_rejected.add_argument("--include-fixture", action="store_true")
+    crypto_paper_rejected.add_argument("--reason", default=None)
     crypto_paper_rejected.set_defaults(rejected_only=True)
     crypto_paper_rejected.set_defaults(func=cmd_crypto_paper_signals)
+    crypto_paper_explain = crypto_paper_sub.add_parser("explain")
+    crypto_paper_explain.add_argument("--signal-id", required=True)
+    crypto_paper_explain.set_defaults(func=cmd_crypto_paper_explain)
+    crypto_paper_l2_context = crypto_paper_sub.add_parser("l2-context")
+    crypto_paper_l2_context.add_argument("--signal-id", required=True)
+    crypto_paper_l2_context.add_argument("--levels", type=int, default=5)
+    crypto_paper_l2_context.set_defaults(func=cmd_crypto_paper_l2_context)
     crypto_paper_runs = crypto_paper_sub.add_parser("runs")
     crypto_paper_runs.add_argument("--limit", type=int, default=20)
     crypto_paper_runs.add_argument("--include-fixture", action="store_true")
@@ -1860,6 +1984,11 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_artifacts = crypto_paper_sub.add_parser("artifacts")
     crypto_paper_artifacts.add_argument("--run-id", required=True)
     crypto_paper_artifacts.set_defaults(func=cmd_crypto_paper_artifacts)
+    crypto_paper_readiness = crypto_paper_sub.add_parser("readiness")
+    crypto_paper_readiness.add_argument("--include-fixture", action="store_true")
+    crypto_paper_readiness.add_argument("--min-signals", type=int, default=30)
+    crypto_paper_readiness.add_argument("--min-positions", type=int, default=5)
+    crypto_paper_readiness.set_defaults(func=cmd_crypto_paper_readiness)
 
     l2 = sub.add_parser("l2-recorder")
     l2_sub = l2.add_subparsers(dest="l2_command", required=True)

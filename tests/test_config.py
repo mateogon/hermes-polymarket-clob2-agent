@@ -32,3 +32,14 @@ def test_hermes_database_path_env_override(monkeypatch, tmp_path):
     settings = load_settings()
 
     assert settings.database_path == db_path
+
+
+def test_hermes_database_path_takes_precedence(monkeypatch, tmp_path):
+    database_path = tmp_path / "database.sqlite3"
+    hermes_path = tmp_path / "hermes.sqlite3"
+    monkeypatch.setenv("DATABASE_PATH", str(database_path))
+    monkeypatch.setenv("HERMES_DATABASE_PATH", str(hermes_path))
+
+    settings = load_settings()
+
+    assert settings.database_path == hermes_path

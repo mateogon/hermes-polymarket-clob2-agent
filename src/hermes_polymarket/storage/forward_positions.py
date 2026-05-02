@@ -162,6 +162,7 @@ def forward_signals(
     run_id: str | None = None,
     include_fixture: bool = False,
     rejected_only: bool = False,
+    risk_reason: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     clauses: list[str] = []
@@ -173,6 +174,9 @@ def forward_signals(
         clauses.append("fixture = 0")
     if rejected_only:
         clauses.append("final_action != 'paper_fill'")
+    if risk_reason:
+        clauses.append("risk_reason = ?")
+        values.append(risk_reason)
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
     rows = db.conn.execute(
         f"SELECT * FROM forward_paper_signals {where} ORDER BY created_at DESC LIMIT ?",

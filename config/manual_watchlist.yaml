@@ -1,0 +1,8 @@
+markets:
+  - symbol: ethusdt
+    slug: ethereum-up-or-down-on-may-2-2026
+    question: ethereum-up-or-down-on-may-2-2026
+    condition_id: "0xa2bf9bbb05ecdd733d4c4e6f8b8f27685bbc7691acbcd7417fefbd51070ab0d6"
+    yes_token_id: "52019703302953684629024431461679093528195494994396793755789945598392152241536"
+    no_token_id: "64978032187743224142169955449627999302760708214084064505552953099478317720430"
+    yes_direction: up

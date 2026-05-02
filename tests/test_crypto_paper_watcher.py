@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from hermes_polymarket.crypto.paper_watcher import PaperWatcherConfig, run_crypto_paper_watcher
 from hermes_polymarket.data_sources.base import DataEvent, EventType
@@ -6,6 +7,7 @@ from hermes_polymarket.data_sources.event_bus import EventBus
 from hermes_polymarket.storage.crypto_latency import crypto_latency_opportunities
 from hermes_polymarket.storage.crypto_watchlist import upsert_crypto_market_watchlist
 from hermes_polymarket.storage.db import Database
+from hermes_polymarket.storage.forward_positions import forward_signals
 
 
 async def _publish_fixture(bus: EventBus) -> None:
@@ -88,5 +90,11 @@ def test_crypto_paper_watcher_records_paper_opportunity(tmp_path):
         rows = crypto_latency_opportunities(db, limit=10)
         assert rows
         assert rows[0]["data_quality"] == "paper_live"
+        signals = forward_signals(db, run_id=summary.run_id, limit=10)
+        assert signals
+        payload = json.loads(signals[0]["payload_json"])
+        assert payload["threshold_pct"] == 0.5
+        assert "slippage" in payload
+        assert "shadow_risk" in payload
 
     asyncio.run(run())

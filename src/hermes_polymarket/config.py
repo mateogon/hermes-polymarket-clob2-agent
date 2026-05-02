@@ -82,8 +82,8 @@ def load_settings(config_dir: Path | None = None) -> Settings:
     risk = _read_yaml(config_dir / "risk.yaml")
 
     db_path_value = (
-        os.getenv("DATABASE_PATH")
-        or os.getenv("HERMES_DATABASE_PATH")
+        os.getenv("HERMES_DATABASE_PATH")
+        or os.getenv("DATABASE_PATH")
         or str(default.get("database_path", "data/hermes_polymarket.sqlite3"))
     )
     db_path = Path(db_path_value)
