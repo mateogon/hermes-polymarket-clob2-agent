@@ -81,7 +81,12 @@ def load_settings(config_dir: Path | None = None) -> Settings:
     default = _read_yaml(config_dir / "default.yaml")
     risk = _read_yaml(config_dir / "risk.yaml")
 
-    db_path = Path(str(default.get("database_path", "data/hermes_polymarket.sqlite3")))
+    db_path_value = (
+        os.getenv("DATABASE_PATH")
+        or os.getenv("HERMES_DATABASE_PATH")
+        or str(default.get("database_path", "data/hermes_polymarket.sqlite3"))
+    )
+    db_path = Path(db_path_value)
     if not db_path.is_absolute():
         db_path = PROJECT_ROOT / db_path
 
@@ -110,4 +115,3 @@ def load_settings(config_dir: Path | None = None) -> Settings:
         min_entry_price=float(risk.get("min_entry_price", 0.03)),
         max_entry_price=float(risk.get("max_entry_price", 0.97)),
     )
-
