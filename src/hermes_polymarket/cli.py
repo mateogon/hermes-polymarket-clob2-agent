@@ -912,7 +912,13 @@ def cmd_crypto_latency_source_health(_: argparse.Namespace) -> int:
 
 def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
     from hermes_polymarket.data_sources.base import now_ms
-    from hermes_polymarket.storage.crypto_watchlist import clear_crypto_market_watchlist, crypto_market_watchlist, upsert_crypto_market_watchlist
+    from hermes_polymarket.crypto.market_quality import watchlist_health_report
+    from hermes_polymarket.storage.crypto_watchlist import (
+        clear_crypto_market_watchlist,
+        crypto_market_watchlist,
+        set_crypto_market_watchlist_active,
+        upsert_crypto_market_watchlist,
+    )
     try:
         import yaml
     except Exception:  # pragma: no cover - dependency is expected in normal runtime
@@ -998,6 +1004,35 @@ def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
         elif args.watchlist_action == "clear":
             deleted = clear_crypto_market_watchlist(db)
             print(json.dumps({"mode": "measurement_paper_only", "status": "cleared", "deleted": deleted}, indent=2, sort_keys=True))
+        elif args.watchlist_action == "health":
+            print(json.dumps(watchlist_health_report(db, symbol=args.symbol, active_only=not args.all, limit=args.limit), indent=2, sort_keys=True))
+        elif args.watchlist_action == "disable":
+            updated = set_crypto_market_watchlist_active(db, condition_id=args.condition_id, active=False)
+            print(json.dumps({"mode": "measurement_paper_only", "status": "disabled", "condition_id": args.condition_id, "updated": updated}, indent=2, sort_keys=True))
+        elif args.watchlist_action == "enable":
+            updated = set_crypto_market_watchlist_active(db, condition_id=args.condition_id, active=True)
+            print(json.dumps({"mode": "measurement_paper_only", "status": "enabled", "condition_id": args.condition_id, "updated": updated}, indent=2, sort_keys=True))
+        elif args.watchlist_action == "prune-bad":
+            report = watchlist_health_report(db, symbol=args.symbol, active_only=True, limit=args.limit)
+            disabled: list[str] = []
+            for market in report["markets"]:
+                if market["recommended_action"] != "disable_or_replace_market":
+                    continue
+                disabled.append(str(market["condition_id"]))
+                if not args.dry_run:
+                    set_crypto_market_watchlist_active(db, condition_id=str(market["condition_id"]), active=False)
+            print(
+                json.dumps(
+                    {
+                        "mode": "measurement_paper_only",
+                        "status": "dry_run" if args.dry_run else "pruned",
+                        "disabled": disabled,
+                        "health": report,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
         else:
             rows = crypto_market_watchlist(db, active_only=not args.all, limit=args.limit)
             print(json.dumps({"mode": "measurement_paper_only", "watchlist": rows}, indent=2, sort_keys=True))
@@ -1890,6 +1925,15 @@ def build_parser() -> argparse.ArgumentParser:
     watchlist_clear = watchlist_sub.add_parser("clear")
     watchlist_import = watchlist_sub.add_parser("import")
     watchlist_import.add_argument("--file", required=True)
+    watchlist_health = watchlist_sub.add_parser("health")
+    watchlist_health.add_argument("--symbol", default=None)
+    watchlist_disable = watchlist_sub.add_parser("disable")
+    watchlist_disable.add_argument("--condition-id", required=True)
+    watchlist_enable = watchlist_sub.add_parser("enable")
+    watchlist_enable.add_argument("--condition-id", required=True)
+    watchlist_prune = watchlist_sub.add_parser("prune-bad")
+    watchlist_prune.add_argument("--symbol", default=None)
+    watchlist_prune.add_argument("--dry-run", action="store_true")
     crypto_watchlist.set_defaults(func=cmd_crypto_latency_watchlist)
     crypto_health = crypto_sub.add_parser("source-health")
     crypto_health.set_defaults(func=cmd_crypto_latency_source_health)

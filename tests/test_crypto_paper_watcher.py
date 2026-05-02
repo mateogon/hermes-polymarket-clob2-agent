@@ -98,3 +98,70 @@ def test_crypto_paper_watcher_records_paper_opportunity(tmp_path):
         assert "shadow_risk" in payload
 
     asyncio.run(run())
+
+
+def test_crypto_paper_watcher_market_quality_rejects_bad_book(tmp_path):
+    async def run():
+        db = Database(tmp_path / "x.sqlite")
+        db.init_schema(1000)
+        upsert_crypto_market_watchlist(
+            db,
+            {
+                "condition_id": "condition",
+                "slug": "eth-test",
+                "symbol": "ethusdt",
+                "yes_token_id": "yes-token",
+                "no_token_id": "no-token",
+                "up_token_id": "yes-token",
+                "down_token_id": "no-token",
+                "direction_map": {"up": "yes-token", "down": "no-token"},
+                "active": True,
+                "discovered_at_ms": 1,
+            },
+        )
+        bus = EventBus()
+        await bus.publish(
+            DataEvent(
+                "fixture_market_ws",
+                EventType.POLY_BOOK,
+                1000,
+                1000,
+                "yes-token",
+                {
+                    "asset_id": "yes-token",
+                    "market": "condition",
+                    "bids": [],
+                    "asks": [{"price": "0.001", "size": "100000"}],
+                },
+            )
+        )
+        events = [
+            ("fixture_binance", EventType.BINANCE_TRADE, "ethusdt", {"symbol": "ETHUSDT", "price": 100.0}),
+            ("fixture_coinbase", EventType.COINBASE_TICKER, "eth-usd", {"product_id": "ETH-USD", "price": 100.0}),
+            ("fixture_binance", EventType.BINANCE_TRADE, "ethusdt", {"symbol": "ETHUSDT", "price": 101.0}),
+            ("fixture_coinbase", EventType.COINBASE_TICKER, "eth-usd", {"product_id": "ETH-USD", "price": 101.0}),
+        ]
+        ts = 1100
+        for source, event_type, key, payload in events:
+            await bus.publish(DataEvent(source, event_type, ts, ts, key, payload))
+            ts += 1000
+
+        summary = await run_crypto_paper_watcher(
+            db=db,
+            bus=bus,
+            config=PaperWatcherConfig(
+                symbols=("ethusdt",),
+                seconds=1,
+                min_move_pct=0.5,
+                cooldown_ms=0,
+            ),
+        )
+
+        assert summary.signals_generated >= 1
+        assert summary.paper_opportunities == 0
+        signals = forward_signals(db, run_id=summary.run_id, limit=10)
+        assert signals[0]["final_action"] == "market_quality_rejected"
+        payload = json.loads(signals[0]["payload_json"])
+        assert payload["market_quality"]["allowed"] is False
+
+    asyncio.run(run())

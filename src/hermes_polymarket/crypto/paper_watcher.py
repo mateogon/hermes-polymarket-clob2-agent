@@ -16,6 +16,7 @@ from uuid import uuid4
 from hermes_polymarket.config import Settings, load_settings
 from hermes_polymarket.crypto.directional_mapping import DirectionalToken, desired_direction_from_move, select_directional_token
 from hermes_polymarket.crypto.event_adapter import price_reading_from_event
+from hermes_polymarket.crypto.market_quality import MarketQualityDecision, evaluate_market_quality
 from hermes_polymarket.crypto.runtime_state import CryptoRuntimeState
 from hermes_polymarket.data_sources.base import DataEvent, EventType
 from hermes_polymarket.data_sources.event_bus import EventBus
@@ -316,6 +317,71 @@ def _record_token_opportunity(
     return 1, int(filled), int(not risk_allowed), position
 
 
+def _record_market_quality_rejection(
+    db: Database,
+    *,
+    run_id: str,
+    event_id: str,
+    token_id: str,
+    market: dict[str, Any],
+    direction: str,
+    external_move_ts_ms: int,
+    external_move_pct: float,
+    amount_usd: float,
+    model_probability: float,
+    threshold_pct: float,
+    source_consensus: dict[str, Any],
+    quality: MarketQualityDecision,
+    fixture: bool,
+) -> None:
+    payload = {
+        "mode": "forward_paper_watcher",
+        "threshold_pct": threshold_pct,
+        "external_move_pct": external_move_pct,
+        "selected_direction": direction,
+        "selected_token_id": token_id,
+        "direction_mapping_source": "watchlist",
+        "model_probability_raw": model_probability,
+        "confidence": 0.35,
+        "condition_id": market.get("condition_id"),
+        "slug": market.get("slug"),
+        "symbol": market.get("symbol"),
+        "direction": direction,
+        "external_move_ts_ms": external_move_ts_ms,
+        "risk_allowed": False,
+        "risk_reason": quality.reason,
+        "risk_explanation": "Market quality gate rejected this token before risk evaluation",
+        "source_consensus": source_consensus,
+        "market_quality": quality.to_dict(),
+    }
+    insert_forward_signal(
+        db,
+        {
+            "signal_id": event_id,
+            "run_id": run_id,
+            "symbol": str(market.get("symbol") or ""),
+            "condition_id": str(market.get("condition_id") or ""),
+            "token_id": token_id,
+            "outcome": str(market.get("outcome") or ""),
+            "direction": direction,
+            "external_move_ts_ms": external_move_ts_ms,
+            "external_move_pct": external_move_pct,
+            "final_action": "market_quality_rejected",
+            "risk_reason": quality.reason,
+            "fill_status": None,
+            "best_bid": quality.best_bid,
+            "best_ask": quality.best_ask,
+            "spread": quality.spread,
+            "avg_price": None,
+            "shares": None,
+            "amount_usd": amount_usd,
+            "model_probability": model_probability,
+            "fixture": fixture,
+            "payload": payload,
+        },
+    )
+
+
 def _mark_open_positions(
     db: Database,
     *,
@@ -521,6 +587,30 @@ async def run_crypto_paper_watcher(
             )
             risk_rejected += 1
         else:
+            state = book_state.by_token.get(selected.token_id)
+            if state is None:
+                quality = MarketQualityDecision(False, "no_local_book_state", None, None, None, 0.0, 0.0)
+            else:
+                quality = evaluate_market_quality(state.as_orderbook())
+            if not quality.allowed:
+                _record_market_quality_rejection(
+                    db,
+                    run_id=run_id,
+                    event_id=signal.event_id,
+                    token_id=selected.token_id,
+                    market=market,
+                    direction=selected.direction,
+                    external_move_ts_ms=signal.detected_ts_ms,
+                    external_move_pct=signal.external_move_pct,
+                    amount_usd=config.amount_usd,
+                    model_probability=config.model_probability,
+                    threshold_pct=config.min_move_pct,
+                    source_consensus={"sources": list(current.sources), "max_deviation_pct": current.max_deviation_pct},
+                    quality=quality,
+                    fixture=config.fixture,
+                )
+                risk_rejected += 1
+                continue
             opp_delta, fill_delta, reject_delta, position = _record_token_opportunity(
                 db,
                 run_id=run_id,
