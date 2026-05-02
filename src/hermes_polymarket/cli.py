@@ -198,8 +198,18 @@ def cmd_wallet_flow_replay(args: argparse.Namespace) -> int:
             mode=args.mode.replace("-", "_"),
             paper_amount_usd=args.amount,
             exit_model=ExitModel(args.exit_model),
+            data_quality=args.mode.replace("-", "_"),
         )
-        run_id, results, summary = replay_wallet_trades(trades, config)
+        if config.mode == "local_l2":
+            import uuid
+
+            from hermes_polymarket.backtest.wallet_replay_local_l2 import replay_wallet_trades_local_l2, summarize_local_l2_replay
+
+            run_id = f"wallet_replay_{uuid.uuid4().hex[:12]}"
+            results = replay_wallet_trades_local_l2(db, trades, config, run_id=run_id)
+            summary = summarize_local_l2_replay(results)
+        else:
+            run_id, results, summary = replay_wallet_trades(trades, config)
         quality = None
         if args.quality_warnings:
             from hermes_polymarket.backtest.replay_quality import replay_quality_warnings
@@ -1159,6 +1169,33 @@ def cmd_l2_recorder_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_l2_recorder_coverage(args: argparse.Namespace) -> int:
+    from hermes_polymarket.backtest.local_l2_coverage import local_l2_coverage_report
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        if args.token_id:
+            reports = [local_l2_coverage_report(db, token_id=args.token_id)]
+        else:
+            token_rows = db.conn.execute(
+                """
+                SELECT token_id FROM l2_book_snapshots
+                UNION
+                SELECT token_id FROM l2_price_changes
+                UNION
+                SELECT token_id FROM l2_bbo_updates
+                ORDER BY token_id
+                """
+            ).fetchall()
+            reports = [local_l2_coverage_report(db, token_id=row["token_id"]) for row in token_rows]
+        print(json.dumps({"mode": "local_l2_paper_only", "data_quality": "local_l2", "coverage": reports}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
 def cmd_l2_recorder_reconstruct(args: argparse.Namespace) -> int:
     from hermes_polymarket.backtest.local_l2_lookup import nearest_bbo_before, reconstruct_book_at
 
@@ -1184,6 +1221,23 @@ def cmd_l2_recorder_reconstruct(args: argparse.Namespace) -> int:
         return 0 if token_state is not None else 2
     finally:
         db.close()
+
+
+def cmd_crypto_latency_replay_opportunities(args: argparse.Namespace) -> int:
+    from hermes_polymarket.backtest.crypto_latency_local_l2_replay import replay_crypto_latency_opportunities_local_l2
+
+    if args.mode != "local-l2":
+        print("Only --mode local-l2 is implemented for replay-opportunities.")
+        return 2
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        result = replay_crypto_latency_opportunities_local_l2(db, amount_usd=args.amount, limit=args.limit)
+        print(json.dumps(result, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
 
 
 def _write_crypto_latency_artifacts(db: Database, payload: dict[str, Any]) -> Path:
@@ -1405,6 +1459,11 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_raw.add_argument("--source", required=True)
     crypto_raw.add_argument("--last", type=int, default=20)
     crypto_raw.set_defaults(func=cmd_crypto_latency_raw_samples)
+    crypto_replay_opps = crypto_sub.add_parser("replay-opportunities")
+    crypto_replay_opps.add_argument("--mode", default="local-l2", choices=["local-l2"])
+    crypto_replay_opps.add_argument("--amount", type=float, default=5.0)
+    crypto_replay_opps.add_argument("--limit", type=int, default=100)
+    crypto_replay_opps.set_defaults(func=cmd_crypto_latency_replay_opportunities)
     crypto_opps = crypto_sub.add_parser("opportunities")
     crypto_opps.add_argument("--limit", type=int, default=50)
     crypto_opps.set_defaults(func=cmd_crypto_latency_opportunities)
@@ -1421,6 +1480,9 @@ def build_parser() -> argparse.ArgumentParser:
     l2_status = l2_sub.add_parser("status")
     l2_status.add_argument("--limit", type=int, default=10)
     l2_status.set_defaults(func=cmd_l2_recorder_status)
+    l2_coverage = l2_sub.add_parser("coverage")
+    l2_coverage.add_argument("--token-id", default=None)
+    l2_coverage.set_defaults(func=cmd_l2_recorder_coverage)
     l2_reconstruct = l2_sub.add_parser("reconstruct")
     l2_reconstruct.add_argument("--token-id", required=True)
     l2_reconstruct.add_argument("--timestamp-ms", type=int, required=True)
