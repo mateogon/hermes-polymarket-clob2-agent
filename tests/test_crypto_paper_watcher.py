@@ -20,7 +20,7 @@ async def _publish_fixture(bus: EventBus) -> None:
                 "asset_id": "yes-token",
                 "market": "condition",
                 "bids": [{"price": "0.49", "size": "100"}],
-                "asks": [{"price": "0.51", "size": "100"}],
+                "asks": [{"price": "0.50", "size": "100"}],
             },
         )
     )
@@ -34,6 +34,16 @@ async def _publish_fixture(bus: EventBus) -> None:
     for source, event_type, key, payload in events:
         await bus.publish(DataEvent(source, event_type, ts, ts, key, payload))
         ts += 1000
+    await bus.publish(
+        DataEvent(
+            "fixture_market_ws",
+            EventType.POLY_BEST_BID_ASK,
+            ts,
+            ts,
+            "yes-token",
+            {"asset_id": "yes-token", "market": "condition", "best_bid": "0.60", "best_ask": "0.61"},
+        )
+    )
 
 
 def test_crypto_paper_watcher_records_paper_opportunity(tmp_path):
@@ -69,6 +79,9 @@ def test_crypto_paper_watcher_records_paper_opportunity(tmp_path):
         assert summary.signals_generated >= 1
         assert summary.paper_opportunities >= 1
         assert summary.fills_simulated >= 1
+        assert summary.positions_opened == 1
+        assert summary.positions_closed == 1
+        assert summary.marks_written >= 1
         rows = crypto_latency_opportunities(db, limit=10)
         assert rows
         assert rows[0]["data_quality"] == "paper_live"

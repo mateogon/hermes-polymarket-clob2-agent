@@ -1083,12 +1083,25 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
         if not symbols:
             print("crypto-paper watch requires at least one symbol")
             return 2
-        if not args.from_watchlist:
+        if not args.from_watchlist and not args.fixture:
             print("crypto-paper watch requires --from-watchlist so paper fills use known Polymarket token IDs.")
             return 2
         seconds = max(1, min(args.seconds, 900))
         watchlist = crypto_market_watchlist(db, active_only=True, limit=args.max_watchlist_markets) if args.from_watchlist else []
         token_ids = watchlist_token_ids(db, active_only=True, limit=args.max_watchlist_markets) if args.from_watchlist else ()
+        if args.fixture and not watchlist:
+            watchlist = [
+                {
+                    "condition_id": "fixture-condition",
+                    "slug": "fixture-crypto-paper",
+                    "question": "Fixture crypto paper market",
+                    "symbol": symbols[0],
+                    "yes_token_id": "fixture-yes-token",
+                    "no_token_id": "fixture-no-token",
+                    "active": 1,
+                }
+            ]
+            token_ids = ("fixture-yes-token", "fixture-no-token")
         if args.from_watchlist and not token_ids:
             print("No token IDs found. Run crypto-latency discover or crypto-latency watchlist add first.")
             return 2
@@ -1108,7 +1121,7 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                                 "asset_id": token_id,
                                 "market": market["condition_id"],
                                 "bids": [{"price": "0.49", "size": "100"}],
-                                "asks": [{"price": "0.51", "size": "100"}],
+                                "asks": [{"price": "0.50", "size": "100"}],
                             },
                         )
                     )
@@ -1119,7 +1132,7 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                             event_ts_ms=ts + 10,
                             received_ts_ms=ts + 10,
                             key=token_id,
-                            payload={"asset_id": token_id, "market": market["condition_id"], "best_bid": "0.49", "best_ask": "0.51"},
+                            payload={"asset_id": token_id, "market": market["condition_id"], "best_bid": "0.49", "best_ask": "0.50"},
                         )
                     )
             symbol = symbols[0]
@@ -1146,6 +1159,18 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                     )
                 )
                 ts += 1000
+            for market in watchlist:
+                for token_id in (str(market["yes_token_id"]), str(market["no_token_id"])):
+                    await bus.publish(
+                        DataEvent(
+                            source="fixture_market_ws",
+                            event_type=EventType.POLY_BEST_BID_ASK,
+                            event_ts_ms=ts + 100,
+                            received_ts_ms=ts + 100,
+                            key=token_id,
+                            payload={"asset_id": token_id, "market": market["condition_id"], "best_bid": "0.60", "best_ask": "0.61"},
+                        )
+                    )
 
         async def run() -> dict[str, Any]:
             bus = EventBus()
@@ -1183,8 +1208,12 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                         max_deviation_pct=args.max_deviation_pct,
                         min_sources=args.min_sources,
                         cooldown_ms=args.cooldown_ms,
+                        take_profit_cents=args.take_profit_cents,
+                        stop_loss_cents=args.stop_loss_cents,
+                        timeout_seconds=args.timeout_seconds,
                     ),
                     watchlist=watchlist,
+                    settings=settings,
                 )
             finally:
                 for task in tasks:
@@ -1204,6 +1233,34 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
             }
 
         print(json.dumps(asyncio.run(run()), indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_paper_positions(args: argparse.Namespace) -> int:
+    from hermes_polymarket.storage.forward_positions import forward_positions
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        status = "open" if args.open else "closed" if args.closed else None
+        rows = forward_positions(db, status=status, limit=args.limit)
+        print(json.dumps({"mode": "forward_paper_only", "data_quality": "paper_live", "positions": rows}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_paper_report(_: argparse.Namespace) -> int:
+    from hermes_polymarket.storage.forward_positions import forward_position_report
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        print(json.dumps(forward_position_report(db), indent=2, sort_keys=True))
     finally:
         db.close()
     return 0
@@ -1622,9 +1679,19 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_watch.add_argument("--max-deviation-pct", type=float, default=0.25)
     crypto_paper_watch.add_argument("--min-sources", type=int, default=2)
     crypto_paper_watch.add_argument("--cooldown-ms", type=int, default=5000)
+    crypto_paper_watch.add_argument("--take-profit-cents", type=float, default=8.0)
+    crypto_paper_watch.add_argument("--stop-loss-cents", type=float, default=4.0)
+    crypto_paper_watch.add_argument("--timeout-seconds", type=int, default=900)
     crypto_paper_watch.add_argument("--disable-rtds", action="store_true")
     crypto_paper_watch.add_argument("--fixture", action="store_true")
     crypto_paper_watch.set_defaults(func=cmd_crypto_paper_watch)
+    crypto_paper_positions = crypto_paper_sub.add_parser("positions")
+    crypto_paper_positions.add_argument("--open", action="store_true")
+    crypto_paper_positions.add_argument("--closed", action="store_true")
+    crypto_paper_positions.add_argument("--limit", type=int, default=100)
+    crypto_paper_positions.set_defaults(func=cmd_crypto_paper_positions)
+    crypto_paper_report = crypto_paper_sub.add_parser("report")
+    crypto_paper_report.set_defaults(func=cmd_crypto_paper_report)
 
     l2 = sub.add_parser("l2-recorder")
     l2_sub = l2.add_subparsers(dest="l2_command", required=True)

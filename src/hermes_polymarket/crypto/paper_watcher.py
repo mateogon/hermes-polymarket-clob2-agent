@@ -13,11 +13,24 @@ from time import time
 from typing import Any
 from uuid import uuid4
 
+from hermes_polymarket.config import Settings, load_settings
 from hermes_polymarket.crypto.event_adapter import price_reading_from_event
 from hermes_polymarket.crypto.runtime_state import CryptoRuntimeState
 from hermes_polymarket.data_sources.base import DataEvent, EventType
 from hermes_polymarket.data_sources.event_bus import EventBus
+from hermes_polymarket.forward_paper.lifecycle import (
+    ForwardPaperPosition,
+    close_position,
+    mark_position,
+    open_position_from_signal,
+    should_exit_position,
+    update_excursions,
+)
+from hermes_polymarket.forward_paper.models import ForwardPaperSignal
 from hermes_polymarket.polymarket.orderbook import simulate_buy_fill
+from hermes_polymarket.polymarket.types import MarketMetadata, TokenInfo, TradeProposal
+from hermes_polymarket.risk.exposure import ExposureSnapshot
+from hermes_polymarket.risk.risk_manager import RiskManager
 from hermes_polymarket.signals.crypto_latency_detector import detect_external_move
 from hermes_polymarket.signals.source_consensus import consensus_price
 from hermes_polymarket.state.orderbook_state import OrderBookState
@@ -28,6 +41,7 @@ from hermes_polymarket.storage.crypto_latency import (
 )
 from hermes_polymarket.storage.crypto_watchlist import crypto_market_watchlist
 from hermes_polymarket.storage.db import Database
+from hermes_polymarket.storage.forward_positions import insert_forward_mark, upsert_forward_position
 from hermes_polymarket.storage.l2 import persist_l2_event
 
 
@@ -36,6 +50,10 @@ class PaperWatcherConfig:
     symbols: tuple[str, ...]
     seconds: int
     amount_usd: float = 5.0
+    take_profit_cents: float = 8.0
+    stop_loss_cents: float = 4.0
+    timeout_seconds: int = 900
+    model_probability: float = 0.60
     min_sources: int = 2
     max_age_ms: int = 2500
     max_deviation_pct: float = 0.25
@@ -54,6 +72,9 @@ class PaperWatcherSummary:
     paper_opportunities: int
     fills_simulated: int
     risk_rejected: int
+    positions_opened: int
+    positions_closed: int
+    marks_written: int
     l2_events_seen: int
     dropped_events: int
     watchlist_markets: int
@@ -113,18 +134,59 @@ def _persist_signal_event(
 def _record_token_opportunity(
     db: Database,
     *,
+    run_id: str,
     event_id: str,
     token_id: str,
     market: dict[str, Any],
     book_state: OrderBookState,
     amount_usd: float,
-) -> tuple[int, int, int]:
+    external_move_ts_ms: int,
+    model_probability: float,
+    settings: Settings,
+    open_position_count: int,
+) -> tuple[int, int, int, ForwardPaperPosition | None]:
     state = book_state.by_token.get(token_id)
     fill = None
     if state is not None:
         fill = simulate_buy_fill(state.as_orderbook(), amount_usd, order_type="fok")
 
     filled = bool(fill and fill.filled)
+    risk_allowed = False
+    risk_reason = "no_executable_fill"
+    risk_explanation = "No executable fill available"
+    if filled and state is not None and fill is not None:
+        book = state.as_orderbook()
+        proposal = TradeProposal(
+            market_id=str(market["condition_id"]),
+            condition_id=str(market["condition_id"]),
+            token_id=token_id,
+            outcome=str(market.get("outcome") or ""),
+            side="buy",
+            amount_usd=amount_usd,
+            model_probability=model_probability,
+            confidence=0.35,
+            reason="crypto forward paper signal",
+        )
+        metadata = MarketMetadata(
+            condition_id=str(market["condition_id"]),
+            min_tick_size=0.01,
+            min_order_size=1.0,
+            tokens=(TokenInfo(str(market["yes_token_id"]), "YES"), TokenInfo(str(market["no_token_id"]), "NO")),
+        )
+        if token_id not in {token.token_id for token in metadata.tokens}:
+            risk_reason = "token_not_in_market"
+            risk_explanation = "Token ID is not part of watchlist metadata"
+        else:
+            decision = RiskManager(settings).evaluate(
+                proposal,
+                book,
+                fill,
+                ExposureSnapshot(bankroll=settings.initial_bankroll, open_positions=open_position_count),
+            )
+            risk_allowed = decision.allowed
+            risk_reason = decision.reason
+            risk_explanation = decision.explanation
+
     row = {
         "opportunity_id": f"paper_opp_{uuid4().hex[:12]}",
         "event_id": event_id,
@@ -135,21 +197,105 @@ def _record_token_opportunity(
         "avg_price": fill.avg_price if fill else None,
         "shares": fill.total_shares if fill else None,
         "fill_status": fill.status if fill else "no_local_book_state",
-        "risk_allowed": False,
-        "risk_reason": "paper_forward_observation_only" if filled else "no_executable_fill",
+        "risk_allowed": risk_allowed,
+        "risk_reason": risk_reason,
         "data_quality": "paper_live",
         "payload": {
             "mode": "forward_paper_watcher",
             "condition_id": market.get("condition_id"),
             "slug": market.get("slug"),
             "symbol": market.get("symbol"),
+            "external_move_ts_ms": external_move_ts_ms,
             "best_bid": state.best_bid if state else None,
             "best_ask": state.best_ask if state else None,
             "spread": state.spread if state else None,
+            "risk_explanation": risk_explanation,
         },
     }
     insert_crypto_latency_opportunity(db, row)
-    return 1, int(filled), 1
+    signal = ForwardPaperSignal(
+        signal_id=event_id,
+        run_id=run_id,
+        symbol=str(market.get("symbol") or ""),
+        condition_id=str(market.get("condition_id") or ""),
+        token_id=token_id,
+        outcome=str(market.get("outcome") or ""),
+        external_move_ts_ms=external_move_ts_ms,
+        amount_usd=amount_usd,
+        final_action="paper_fill" if risk_allowed else "risk_rejected",
+        avg_price=fill.avg_price if fill else None,
+        shares=fill.total_shares if fill else None,
+        best_bid=state.best_bid if state else None,
+        best_ask=state.best_ask if state else None,
+        spread=state.spread if state else None,
+    )
+    position = open_position_from_signal(signal)
+    return 1, int(filled), int(not risk_allowed), position
+
+
+def _mark_open_positions(
+    db: Database,
+    *,
+    book_state: OrderBookState,
+    positions: dict[str, ForwardPaperPosition],
+    event: DataEvent,
+    config: PaperWatcherConfig,
+) -> tuple[int, int]:
+    marks = 0
+    closed = 0
+    for position_id, position in list(positions.items()):
+        if position.token_id != str(event.payload.get("asset_id") or event.key):
+            continue
+        state = book_state.by_token.get(position.token_id)
+        if state is None or state.best_bid is None:
+            continue
+        mark_price = state.best_bid
+        unrealized, mfe, mae = mark_position(position, mark_price=mark_price)
+        marked = update_excursions(position, mfe=mfe, mae=mae)
+        insert_forward_mark(
+            db,
+            position_id=position_id,
+            ts_ms=event.received_ts_ms,
+            mark_price=mark_price,
+            best_bid=state.best_bid,
+            best_ask=state.best_ask,
+            unrealized_pnl=unrealized,
+            payload={"source": "forward_paper_watcher"},
+        )
+        db.add_journal(
+            "forward_paper_mark",
+            "Marked forward paper position",
+            {"position_id": position_id, "token_id": position.token_id, "mark_price": mark_price, "unrealized_pnl": unrealized},
+        )
+        marks += 1
+        should_exit, reason = should_exit_position(
+            marked,
+            mark_price=mark_price,
+            ts_ms=event.received_ts_ms,
+            take_profit_cents=config.take_profit_cents,
+            stop_loss_cents=config.stop_loss_cents,
+            timeout_seconds=config.timeout_seconds,
+        )
+        if should_exit:
+            final_position = close_position(marked, ts_ms=event.received_ts_ms, exit_price=mark_price, reason=reason)
+            upsert_forward_position(db, final_position, payload={"source": "forward_paper_watcher"})
+            db.add_journal(
+                "forward_paper_close",
+                "Closed forward paper position",
+                {
+                    "position_id": position_id,
+                    "token_id": position.token_id,
+                    "exit_reason": reason,
+                    "exit_price": mark_price,
+                    "net_pnl": final_position.net_pnl,
+                },
+            )
+            positions.pop(position_id, None)
+            closed += 1
+        else:
+            positions[position_id] = marked
+            upsert_forward_position(db, marked, payload={"source": "forward_paper_watcher"})
+    return marks, closed
 
 
 async def run_crypto_paper_watcher(
@@ -160,12 +306,16 @@ async def run_crypto_paper_watcher(
     watchlist: list[dict[str, Any]] | None = None,
     runtime_state: CryptoRuntimeState | None = None,
     book_state: OrderBookState | None = None,
+    settings: Settings | None = None,
 ) -> PaperWatcherSummary:
+    settings = settings or load_settings()
     runtime_state = runtime_state or CryptoRuntimeState()
     book_state = book_state or OrderBookState()
     watchlist = watchlist if watchlist is not None else crypto_market_watchlist(db, active_only=True, limit=100)
     token_map = token_market_map(watchlist)
     runtime_state.token_to_market.update(token_map)
+    run_id = f"crypto_paper_{uuid4().hex[:12]}"
+    open_positions: dict[str, ForwardPaperPosition] = {}
 
     started = time()
     events_seen = 0
@@ -175,6 +325,9 @@ async def run_crypto_paper_watcher(
     opportunities = 0
     fills = 0
     risk_rejected = 0
+    positions_opened = 0
+    positions_closed = 0
+    marks_written = 0
     l2_events = 0
 
     while time() - started < config.seconds:
@@ -192,6 +345,9 @@ async def run_crypto_paper_watcher(
             if event.event_type in {EventType.POLY_BOOK, EventType.POLY_PRICE_CHANGE, EventType.POLY_BEST_BID_ASK}:
                 persist_l2_event(db, event)
                 l2_events += 1
+            marks_delta, closed_delta = _mark_open_positions(db, book_state=book_state, positions=open_positions, event=event, config=config)
+            marks_written += marks_delta
+            positions_closed += closed_delta
 
         reading = price_reading_from_event(event)
         if reading is None or reading.symbol not in config.symbols:
@@ -255,17 +411,37 @@ async def run_crypto_paper_watcher(
         )
 
         for token_id, market in matched:
-            opp_delta, fill_delta, reject_delta = _record_token_opportunity(
+            opp_delta, fill_delta, reject_delta, position = _record_token_opportunity(
                 db,
+                run_id=run_id,
                 event_id=signal.event_id,
                 token_id=token_id,
                 market=market,
                 book_state=book_state,
                 amount_usd=config.amount_usd,
+                external_move_ts_ms=signal.detected_ts_ms,
+                model_probability=config.model_probability,
+                settings=settings,
+                open_position_count=len(open_positions),
             )
             opportunities += opp_delta
             fills += fill_delta
             risk_rejected += reject_delta
+            if position is not None:
+                open_positions[position.position_id] = position
+                upsert_forward_position(db, position, payload={"source": "forward_paper_watcher"})
+                db.add_journal(
+                    "forward_paper_open",
+                    "Opened forward paper position",
+                    {
+                        "position_id": position.position_id,
+                        "signal_id": position.signal_id,
+                        "token_id": position.token_id,
+                        "entry_price": position.entry_price,
+                        "shares": position.shares,
+                    },
+                )
+                positions_opened += 1
 
         if latency_events >= config.max_events:
             break
@@ -279,6 +455,9 @@ async def run_crypto_paper_watcher(
         paper_opportunities=opportunities,
         fills_simulated=fills,
         risk_rejected=risk_rejected,
+        positions_opened=positions_opened,
+        positions_closed=positions_closed,
+        marks_written=marks_written,
         l2_events_seen=l2_events,
         dropped_events=bus.dropped_events,
         watchlist_markets=len(watchlist),

@@ -435,4 +435,48 @@ CREATE TABLE IF NOT EXISTS l2_recorder_runs (
   ended_at TEXT,
   status TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS forward_paper_positions (
+  position_id TEXT PRIMARY KEY,
+  signal_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  condition_id TEXT,
+  token_id TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  entry_ts_ms INTEGER NOT NULL,
+  entry_price REAL NOT NULL,
+  shares REAL NOT NULL,
+  amount_usd REAL NOT NULL,
+  best_bid_at_entry REAL,
+  best_ask_at_entry REAL,
+  spread_at_entry REAL,
+  status TEXT NOT NULL,
+  exit_ts_ms INTEGER,
+  exit_price REAL,
+  exit_reason TEXT,
+  gross_pnl REAL,
+  net_pnl REAL,
+  max_favorable_excursion REAL NOT NULL DEFAULT 0,
+  max_adverse_excursion REAL NOT NULL DEFAULT 0,
+  data_quality TEXT NOT NULL DEFAULT 'paper_live',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_forward_positions_status
+ON forward_paper_positions(status, token_id);
+
+CREATE TABLE IF NOT EXISTS forward_paper_marks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  position_id TEXT NOT NULL,
+  ts_ms INTEGER NOT NULL,
+  mark_price REAL,
+  best_bid REAL,
+  best_ask REAL,
+  unrealized_pnl REAL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """

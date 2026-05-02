@@ -1,0 +1,18 @@
+lifecycle:
+  enabled: true
+  exit_models:
+    take_profit_cents: 8.0
+    stop_loss_cents: 4.0
+    timeout_seconds: 900
+    allow_resolution_exit: false
+  mark_to_market_interval_seconds: 5
+  close_on_market_resolved: true
+
+paper:
+  amount_usd: 5.0
+  max_open_positions: 5
+  order_type: fok
+
+reporting:
+  write_artifacts: true
+  artifact_dir: artifacts/forward_paper
