@@ -61,6 +61,7 @@ Wallet replay commands:
 .venv/bin/python -m hermes_polymarket.cli wallet-flow replay --wallet coinman2 --delay 0,2,5,15,30,120,600 --mode historical-approx --exit-model leader_exit
 .venv/bin/python -m hermes_polymarket.cli wallet-flow score --wallet coinman2
 .venv/bin/python -m hermes_polymarket.cli wallet-flow leaderboard
+.venv/bin/python -m hermes_polymarket.cli wallet-flow exit-coverage --wallet coinman2
 ```
 
 Replay now reads persisted wallet trades from SQLite. Run `wallet-flow fetch` first; replay refuses clearly if there are no stored trades for that wallet. Output is labeled `historical_approx` unless backed by locally recorded L2 snapshots. In this mode, entry prices are approximated from public wallet trades, not executable L2 orderbooks, so slippage is not reliable yet.
@@ -80,6 +81,8 @@ Each replay also writes:
 - artifacts under `artifacts/runs/<run_id>/`, including `manifest.json`; with `--export-csv`, replay also writes CSVs for trades, delay metrics, skipped reasons, and PnL by category
 
 `resolution_exit` and `risk_exit` are intentionally honest placeholders in historical-approx mode: they return pending reasons until resolution data or local price paths are available.
+
+If `leader_exit` replay produces zero closed trades, run `wallet-flow exit-coverage`. It reports whether observed buys have matching sells for the same wallet, condition ID, and asset ID before moving on to local L2 or crypto latency work.
 
 Live gate check, expected to refuse by default:
 

@@ -122,3 +122,15 @@ def test_wallet_score_persists_and_leaderboard_reads_scores(monkeypatch, tmp_pat
     assert "small_sample" in score_output
     assert cli.main(["wallet-flow", "leaderboard"]) == 0
     assert WALLET in capsys.readouterr().out
+
+
+def test_wallet_exit_coverage_cli_uses_persisted_trades(monkeypatch, tmp_path, capsys):
+    settings = _patch_settings(monkeypatch, tmp_path)
+    db = Database(settings.database_path)
+    db.init_schema(1000)
+    insert_wallet_trades(db, [_trade("BUY", 100, 0.5), _trade("SELL", 200, 0.7)])
+    db.close()
+
+    assert cli.main(["wallet-flow", "exit-coverage", "--wallet", "coinman2"]) == 0
+    output = capsys.readouterr().out
+    assert '"buy_assets_with_sell": 1' in output

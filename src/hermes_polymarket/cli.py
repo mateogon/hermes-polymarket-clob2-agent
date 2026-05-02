@@ -306,6 +306,28 @@ def cmd_wallet_flow_leaderboard(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_wallet_flow_exit_coverage(args: argparse.Namespace) -> int:
+    from hermes_polymarket.backtest.wallet_exit_diagnostics import exit_coverage_report
+    from hermes_polymarket.backtest.wallet_replay_storage import wallet_trades
+    from hermes_polymarket.data_sources.wallet_registry import WalletRegistry
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        wallet = WalletRegistry.load().by_name(args.wallet)
+        trades = wallet_trades(db, wallet.address, limit=args.limit, since_ts=args.since_ts, condition_id=args.condition_id)
+        if not trades:
+            print("No persisted wallet trades. Run wallet-flow fetch first.")
+            return 2
+        report = exit_coverage_report(wallet.address, trades).to_dict()
+        report["wallet_name"] = wallet.name
+        print(json.dumps(report, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
 def _git_commit_sha() -> str:
     try:
         return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True).strip()
@@ -619,6 +641,12 @@ def build_parser() -> argparse.ArgumentParser:
     score.set_defaults(func=cmd_wallet_flow_score)
     leaderboard = wallet_sub.add_parser("leaderboard")
     leaderboard.set_defaults(func=cmd_wallet_flow_leaderboard)
+    exit_coverage = wallet_sub.add_parser("exit-coverage")
+    exit_coverage.add_argument("--wallet", required=True)
+    exit_coverage.add_argument("--limit", type=int, default=5000)
+    exit_coverage.add_argument("--since-ts", type=int, default=None)
+    exit_coverage.add_argument("--condition-id", default=None)
+    exit_coverage.set_defaults(func=cmd_wallet_flow_exit_coverage)
     report = wallet_sub.add_parser("report")
     report.add_argument("--wallet", default=None)
     report.set_defaults(func=cmd_wallet_flow_report)
