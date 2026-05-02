@@ -119,3 +119,59 @@ def forward_position_report(db: Database) -> dict[str, Any]:
         "net_pnl": pnl,
         "win_rate": sum(1 for row in closed if float(row["net_pnl"] or 0.0) > 0) / len(closed) if closed else 0.0,
     }
+
+
+def insert_forward_run(
+    db: Database,
+    *,
+    run_id: str,
+    symbols: tuple[str, ...],
+    config: dict[str, Any],
+    summary: dict[str, Any],
+    report: dict[str, Any],
+    quality: dict[str, Any],
+    artifacts: dict[str, Any],
+) -> None:
+    db.conn.execute(
+        """
+        INSERT OR REPLACE INTO forward_paper_runs
+          (run_id, symbols_json, config_json, summary_json, report_json, quality_json, artifacts_json, ended_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """,
+        (
+            run_id,
+            json.dumps(list(symbols), sort_keys=True),
+            json.dumps(config, sort_keys=True),
+            json.dumps(summary, sort_keys=True),
+            json.dumps(report, sort_keys=True),
+            json.dumps(quality, sort_keys=True),
+            json.dumps(artifacts, sort_keys=True),
+        ),
+    )
+    db.conn.commit()
+
+
+def forward_runs(db: Database, *, limit: int = 20) -> list[dict[str, Any]]:
+    rows = db.conn.execute(
+        "SELECT * FROM forward_paper_runs ORDER BY started_at DESC LIMIT ?",
+        (limit,),
+    )
+    return [dict(row) for row in rows]
+
+
+def forward_run(db: Database, run_id: str) -> dict[str, Any] | None:
+    row = db.conn.execute("SELECT * FROM forward_paper_runs WHERE run_id=?", (run_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def forward_signals_for_run(db: Database, run_id: str, *, limit: int = 500) -> list[dict[str, Any]]:
+    rows = db.conn.execute(
+        """
+        SELECT * FROM crypto_latency_events
+        WHERE payload_json LIKE ?
+        ORDER BY external_move_detected_ts_ms DESC
+        LIMIT ?
+        """,
+        (f"%{run_id}%", limit),
+    )
+    return [dict(row) for row in rows]

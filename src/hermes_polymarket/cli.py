@@ -1069,11 +1069,19 @@ def cmd_crypto_latency_opportunities(args: argparse.Namespace) -> int:
 
 
 def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.artifacts import write_forward_paper_artifacts
+    from hermes_polymarket.forward_paper.quality import forward_paper_quality_warnings
     from hermes_polymarket.crypto.paper_watcher import PaperWatcherConfig, run_crypto_paper_watcher
     from hermes_polymarket.data_sources.base import DataEvent, EventType, now_ms
     from hermes_polymarket.data_sources.event_bus import EventBus
     from hermes_polymarket.storage.crypto_latency import crypto_latency_report
     from hermes_polymarket.storage.crypto_watchlist import crypto_market_watchlist, watchlist_token_ids
+    from hermes_polymarket.storage.forward_positions import (
+        forward_position_report,
+        forward_positions,
+        forward_signals_for_run,
+        insert_forward_run,
+    )
 
     settings = _settings()
     db = Database(settings.database_path)
@@ -1204,6 +1212,7 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                         seconds=seconds,
                         amount_usd=args.amount,
                         min_move_pct=args.min_move_pct,
+                        calibration_thresholds_pct=tuple(float(value) for value in args.threshold_grid.split(",") if value.strip()),
                         max_age_ms=args.max_age_ms,
                         max_deviation_pct=args.max_deviation_pct,
                         min_sources=args.min_sources,
@@ -1221,6 +1230,47 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                 with contextlib.suppress(asyncio.CancelledError):
                     await asyncio.gather(*tasks)
 
+            summary_dict = summary.to_dict()
+            position_report = forward_position_report(db)
+            quality = {
+                "warnings": forward_paper_quality_warnings(
+                    signals=summary.signals_generated,
+                    closed_positions=summary.positions_closed,
+                    min_move_pct=args.min_move_pct,
+                    min_strategy_threshold_pct=args.min_strategy_threshold_pct,
+                ),
+                "threshold_calibration": summary.threshold_calibration,
+                "exploratory_threshold": args.min_move_pct < args.min_strategy_threshold_pct,
+            }
+            signals = forward_signals_for_run(db, summary.run_id, limit=args.max_event_samples)
+            positions = forward_positions(db, limit=500)
+            artifacts: dict[str, str] = {}
+            if args.write_artifacts:
+                artifacts = write_forward_paper_artifacts(
+                    root=Path(args.artifact_dir) / summary.run_id,
+                    run_id=summary.run_id,
+                    summary=summary_dict,
+                    report=position_report,
+                    signals=signals,
+                    positions=positions,
+                    quality=quality,
+                )
+            insert_forward_run(
+                db,
+                run_id=summary.run_id,
+                symbols=symbols,
+                config={
+                    "seconds": seconds,
+                    "amount_usd": args.amount,
+                    "min_move_pct": args.min_move_pct,
+                    "min_strategy_threshold_pct": args.min_strategy_threshold_pct,
+                    "threshold_grid": args.threshold_grid,
+                },
+                summary=summary_dict,
+                report=position_report,
+                quality=quality,
+                artifacts=artifacts,
+            )
             return {
                 "mode": "forward_paper_only",
                 "data_quality": "paper_live" if not args.fixture else "local_observation",
@@ -1228,8 +1278,11 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                 "symbols": symbols,
                 "from_watchlist": args.from_watchlist,
                 "watchlist_token_count": len(token_ids),
-                "summary": summary.to_dict(),
-                "report": crypto_latency_report(db),
+                "summary": summary_dict,
+                "position_report": position_report,
+                "quality": quality,
+                "artifacts": artifacts,
+                "latency_report": crypto_latency_report(db),
             }
 
         print(json.dumps(asyncio.run(run()), indent=2, sort_keys=True))
@@ -1261,6 +1314,36 @@ def cmd_crypto_paper_report(_: argparse.Namespace) -> int:
     db.init_schema(settings.initial_bankroll)
     try:
         print(json.dumps(forward_position_report(db), indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_paper_runs(args: argparse.Namespace) -> int:
+    from hermes_polymarket.storage.forward_positions import forward_runs
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        print(json.dumps({"mode": "forward_paper_only", "runs": forward_runs(db, limit=args.limit)}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_paper_artifacts(args: argparse.Namespace) -> int:
+    from hermes_polymarket.storage.forward_positions import forward_run
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        row = forward_run(db, args.run_id)
+        if row is None:
+            print(f"No forward paper run found for {args.run_id}")
+            return 2
+        print(json.dumps({"mode": "forward_paper_only", "run_id": args.run_id, "artifacts": json.loads(row["artifacts_json"])}, indent=2, sort_keys=True))
     finally:
         db.close()
     return 0
@@ -1679,6 +1762,11 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_watch.add_argument("--max-deviation-pct", type=float, default=0.25)
     crypto_paper_watch.add_argument("--min-sources", type=int, default=2)
     crypto_paper_watch.add_argument("--cooldown-ms", type=int, default=5000)
+    crypto_paper_watch.add_argument("--threshold-grid", default="0.01,0.02,0.03,0.05,0.08")
+    crypto_paper_watch.add_argument("--min-strategy-threshold-pct", type=float, default=0.03)
+    crypto_paper_watch.add_argument("--write-artifacts", action="store_true")
+    crypto_paper_watch.add_argument("--artifact-dir", default="artifacts/forward_paper")
+    crypto_paper_watch.add_argument("--max-event-samples", type=int, default=50)
     crypto_paper_watch.add_argument("--take-profit-cents", type=float, default=8.0)
     crypto_paper_watch.add_argument("--stop-loss-cents", type=float, default=4.0)
     crypto_paper_watch.add_argument("--timeout-seconds", type=int, default=900)
@@ -1692,6 +1780,12 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_positions.set_defaults(func=cmd_crypto_paper_positions)
     crypto_paper_report = crypto_paper_sub.add_parser("report")
     crypto_paper_report.set_defaults(func=cmd_crypto_paper_report)
+    crypto_paper_runs = crypto_paper_sub.add_parser("runs")
+    crypto_paper_runs.add_argument("--limit", type=int, default=20)
+    crypto_paper_runs.set_defaults(func=cmd_crypto_paper_runs)
+    crypto_paper_artifacts = crypto_paper_sub.add_parser("artifacts")
+    crypto_paper_artifacts.add_argument("--run-id", required=True)
+    crypto_paper_artifacts.set_defaults(func=cmd_crypto_paper_artifacts)
 
     l2 = sub.add_parser("l2-recorder")
     l2_sub = l2.add_subparsers(dest="l2_command", required=True)

@@ -479,4 +479,18 @@ CREATE TABLE IF NOT EXISTS forward_paper_marks (
   payload_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS forward_paper_runs (
+  run_id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL DEFAULT 'forward_paper_only',
+  data_quality TEXT NOT NULL DEFAULT 'paper_live',
+  symbols_json TEXT NOT NULL,
+  config_json TEXT NOT NULL DEFAULT '{}',
+  summary_json TEXT NOT NULL DEFAULT '{}',
+  report_json TEXT NOT NULL DEFAULT '{}',
+  quality_json TEXT NOT NULL DEFAULT '{}',
+  artifacts_json TEXT NOT NULL DEFAULT '{}',
+  started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  ended_at TEXT
+);
 """

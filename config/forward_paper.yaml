@@ -16,3 +16,22 @@ paper:
 reporting:
   write_artifacts: true
   artifact_dir: artifacts/forward_paper
+  include_event_samples: true
+  max_event_samples: 50
+
+calibration:
+  exploratory_mode: true
+  threshold_grid_pct:
+    - 0.01
+    - 0.02
+    - 0.03
+    - 0.05
+    - 0.08
+  min_strategy_threshold_pct: 0.03
+
+quality:
+  min_signals_for_strategy_eval: 30
+  min_closed_positions_for_pnl_eval: 20
+  warn_if_no_signals: true
+  warn_if_no_closed_positions: true
+  warn_if_exploratory_threshold: true

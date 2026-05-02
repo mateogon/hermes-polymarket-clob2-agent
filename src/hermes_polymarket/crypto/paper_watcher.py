@@ -18,6 +18,7 @@ from hermes_polymarket.crypto.event_adapter import price_reading_from_event
 from hermes_polymarket.crypto.runtime_state import CryptoRuntimeState
 from hermes_polymarket.data_sources.base import DataEvent, EventType
 from hermes_polymarket.data_sources.event_bus import EventBus
+from hermes_polymarket.forward_paper.calibration import ThresholdCalibration
 from hermes_polymarket.forward_paper.lifecycle import (
     ForwardPaperPosition,
     close_position,
@@ -58,6 +59,7 @@ class PaperWatcherConfig:
     max_age_ms: int = 2500
     max_deviation_pct: float = 0.25
     min_move_pct: float = 0.03
+    calibration_thresholds_pct: tuple[float, ...] = (0.01, 0.02, 0.03, 0.05, 0.08)
     cooldown_ms: int = 5000
     max_events: int = 500
 
@@ -79,6 +81,8 @@ class PaperWatcherSummary:
     dropped_events: int
     watchlist_markets: int
     watchlist_token_count: int
+    run_id: str
+    threshold_calibration: dict[str, int] = field(default_factory=dict)
     source_health: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -110,6 +114,7 @@ def _persist_signal_event(
     reference_price: float,
     current_price: float,
     sources: tuple[str, ...],
+    run_id: str,
 ) -> None:
     insert_crypto_latency_event(
         db,
@@ -122,6 +127,7 @@ def _persist_signal_event(
             "payload": {
                 "data_quality": "paper_live",
                 "mode": "forward_paper_watcher",
+                "run_id": run_id,
                 "reference_price": reference_price,
                 "current_price": current_price,
                 "sources": sources,
@@ -316,6 +322,7 @@ async def run_crypto_paper_watcher(
     runtime_state.token_to_market.update(token_map)
     run_id = f"crypto_paper_{uuid4().hex[:12]}"
     open_positions: dict[str, ForwardPaperPosition] = {}
+    calibration = ThresholdCalibration(list(config.calibration_thresholds_pct))
 
     started = time()
     events_seen = 0
@@ -378,6 +385,8 @@ async def run_crypto_paper_watcher(
         runtime_state.last_consensus_by_symbol[current.symbol] = current
         if previous is None:
             continue
+        raw_move_pct = (current.price - previous.price) / previous.price * 100.0 if previous.price > 0 else 0.0
+        calibration.observe_move(raw_move_pct)
 
         last_event_ts = runtime_state.last_event_ts_by_symbol.get(current.symbol, 0)
         if event.received_ts_ms - last_event_ts < config.cooldown_ms:
@@ -408,6 +417,7 @@ async def run_crypto_paper_watcher(
             reference_price=signal.reference_price,
             current_price=signal.current_price,
             sources=current.sources,
+            run_id=run_id,
         )
 
         for token_id, market in matched:
@@ -462,5 +472,7 @@ async def run_crypto_paper_watcher(
         dropped_events=bus.dropped_events,
         watchlist_markets=len(watchlist),
         watchlist_token_count=len(token_map),
+        run_id=run_id,
+        threshold_calibration=calibration.to_dict(),
         source_health=[dict(row) for row in db.source_health()],
     )
