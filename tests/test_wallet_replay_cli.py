@@ -69,7 +69,7 @@ def test_wallet_replay_cli_uses_persisted_trades_and_writes_learning(monkeypatch
     )
     db.close()
 
-    assert cli.main(["wallet-flow", "replay", "--wallet", "coinman2", "--delay", "0", "--mode", "historical-approx"]) == 0
+    assert cli.main(["wallet-flow", "replay", "--wallet", "coinman2", "--delay", "0", "--mode", "historical-approx", "--export-csv", "--quality-warnings"]) == 0
 
     db = Database(settings.database_path)
     db.init_schema(1000)
@@ -79,7 +79,9 @@ def test_wallet_replay_cli_uses_persisted_trades_and_writes_learning(monkeypatch
     assert memory["status"] == "candidate_rule"
     assert memory["active_in_paper"] == 0
     assert memory["active_in_live"] == 0
-    assert (tmp_path / "artifacts" / "runs").exists()
+    artifact_files = list((tmp_path / "artifacts" / "runs").rglob("*"))
+    assert any(path.name == "manifest.json" for path in artifact_files)
+    assert any(path.name == "replay_trades.csv" for path in artifact_files)
     db.close()
 
 
@@ -96,7 +98,7 @@ def test_wallet_fetch_persists_and_dedupes(monkeypatch, tmp_path, capsys):
             pass
 
     monkeypatch.setattr("hermes_polymarket.data_sources.polymarket_data_api.PolymarketDataApi", FakeDataApi)
-    assert cli.main(["wallet-flow", "fetch", "--wallet", "coinman2", "--limit", "2"]) == 0
+    assert cli.main(["wallet-flow", "fetch", "--wallet", "coinman2", "--page-size", "2", "--max-pages", "1", "--limit-total", "2"]) == 0
     output = capsys.readouterr().out
     assert '"inserted_count": 1' in output
     assert '"duplicate_count": 1' in output

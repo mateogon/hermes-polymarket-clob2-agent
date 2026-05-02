@@ -120,9 +120,9 @@ def cmd_wallet_flow_report(args: argparse.Namespace) -> int:
 
 
 def cmd_wallet_flow_fetch(args: argparse.Namespace) -> int:
+    from hermes_polymarket.backtest.wallet_fetch import fetch_and_persist_wallet_trades_paginated
     from hermes_polymarket.data_sources.polymarket_data_api import PolymarketDataApi
     from hermes_polymarket.data_sources.wallet_registry import WalletRegistry
-    from hermes_polymarket.backtest.wallet_replay_storage import insert_wallet_trades
 
     settings = _settings()
     db = Database(settings.database_path)
@@ -131,17 +131,28 @@ def cmd_wallet_flow_fetch(args: argparse.Namespace) -> int:
     wallet = registry.by_name(args.wallet)
     client = PolymarketDataApi()
     try:
-        trades = client.get_trades_for_wallet(wallet.address, limit=args.limit, min_cash=args.min_cash)
-        counts = insert_wallet_trades(db, trades)
+        limit_total = args.limit_total if args.limit_total is not None else args.limit
+        page_size = args.page_size if args.page_size is not None else args.limit
+        max_pages = args.max_pages if args.max_pages is not None else 1
+        fetch_result = fetch_and_persist_wallet_trades_paginated(
+            db,
+            client,
+            wallet=wallet.address,
+            page_size=page_size,
+            max_pages=max_pages,
+            limit_total=limit_total,
+            min_cash=args.min_cash,
+        )
         payload = {
             "wallet": wallet.name,
             "address": wallet.address,
-            "fetched_count": counts["fetched"],
-            "inserted_count": counts["inserted"],
-            "duplicate_count": counts["duplicates"],
+            "fetched_count": fetch_result.fetched_total,
+            "inserted_count": fetch_result.inserted_total,
+            "duplicate_count": fetch_result.duplicate_total,
+            "pages": [page.__dict__ for page in fetch_result.pages],
         }
         if args.json:
-            payload["trades"] = [trade.raw for trade in trades]
+            payload["trades"] = [trade.raw for trade in fetch_result.trades]
         print(json.dumps(payload, indent=2, sort_keys=True))
     finally:
         client.close()
@@ -173,6 +184,12 @@ def cmd_wallet_flow_replay(args: argparse.Namespace) -> int:
             exit_model=ExitModel(args.exit_model),
         )
         run_id, results, summary = replay_wallet_trades(trades, config)
+        quality = None
+        if args.quality_warnings:
+            from hermes_polymarket.backtest.replay_quality import replay_quality_warnings
+
+            quality = replay_quality_warnings(results).to_dict()
+            summary["quality"] = quality
         insert_replay_run(
             db,
             run_id=run_id,
@@ -185,7 +202,7 @@ def cmd_wallet_flow_replay(args: argparse.Namespace) -> int:
         )
         for result in results:
             insert_replay_trade(db, result.to_storage_dict())
-        artifact_paths = _write_replay_artifacts(run_id, wallet.name, config, summary, results)
+        artifact_paths = _write_replay_artifacts(run_id, wallet.name, config, summary, results, export_csv=args.export_csv, quality=quality)
         _record_replay_experiment(db, run_id, wallet.name, wallet.address, config, summary, artifact_paths)
         _maybe_create_replay_memory(db, run_id, wallet.address, wallet.name, summary)
         print(json.dumps({"run_id": run_id, "wallet": wallet.name, "summary": summary}, indent=2, sort_keys=True))
@@ -289,10 +306,28 @@ def _stable_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
-def _write_replay_artifacts(run_id: str, wallet_name: str, config: object, summary: dict[str, Any], results: list[object]) -> dict[str, str]:
+def _write_replay_artifacts(
+    run_id: str,
+    wallet_name: str,
+    config: object,
+    summary: dict[str, Any],
+    results: list[object],
+    *,
+    export_csv: bool = False,
+    quality: dict[str, Any] | None = None,
+) -> dict[str, str]:
     artifact_base = Path(os.getenv("HERMES_ARTIFACTS_DIR", str(Path(__file__).resolve().parents[2] / "artifacts" / "runs")))
     root = artifact_base / run_id
     root.mkdir(parents=True, exist_ok=True)
+    config_hash = _stable_hash(
+        {
+            "wallet": config.wallet,
+            "mode": config.mode,
+            "delays_seconds": list(config.delays_seconds),
+            "paper_amount_usd": config.paper_amount_usd,
+            "exit_model": config.exit_model.value,
+        }
+    )
     config_payload = {
         "wallet_name": wallet_name,
         "wallet": config.wallet,
@@ -302,12 +337,42 @@ def _write_replay_artifacts(run_id: str, wallet_name: str, config: object, summa
         "paper_amount_usd": config.paper_amount_usd,
         "exit_model": config.exit_model.value,
     }
+    if export_csv:
+        from hermes_polymarket.backtest.replay_artifacts import write_replay_artifacts_csv
+
+        return write_replay_artifacts_csv(
+            root=root,
+            run_id=run_id,
+            summary=summary,
+            results=results,
+            config=config_payload,
+            quality=quality or {},
+            code_commit_sha=_git_commit_sha(),
+            config_hash=config_hash,
+        )
     paths = {
+        "manifest": str(root / "manifest.json"),
         "config": str(root / "config.json"),
         "summary": str(root / "summary.json"),
         "replay_trades": str(root / "replay_trades.jsonl"),
         "notes": str(root / "notes.md"),
     }
+    Path(paths["manifest"]).write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "code_commit_sha": _git_commit_sha(),
+                "config_hash": config_hash,
+                "data_quality": summary.get("data_quality"),
+                "paths": paths,
+                "config": config_payload,
+                "quality": quality or {},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
     Path(paths["config"]).write_text(json.dumps(config_payload, indent=2, sort_keys=True) + "\n")
     Path(paths["summary"]).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     Path(paths["replay_trades"]).write_text("\n".join(json.dumps(result.to_storage_dict(), sort_keys=True) for result in results) + "\n")
@@ -518,6 +583,9 @@ def build_parser() -> argparse.ArgumentParser:
     fetch = wallet_sub.add_parser("fetch")
     fetch.add_argument("--wallet", required=True)
     fetch.add_argument("--limit", type=int, default=100)
+    fetch.add_argument("--page-size", type=int, default=None)
+    fetch.add_argument("--max-pages", type=int, default=None)
+    fetch.add_argument("--limit-total", type=int, default=None)
     fetch.add_argument("--min-cash", type=float, default=None)
     fetch.add_argument("--json", action="store_true", help="Include raw Data API trade payloads in output")
     fetch.set_defaults(func=cmd_wallet_flow_fetch)
@@ -530,6 +598,8 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--since-ts", type=int, default=None)
     replay.add_argument("--condition-id", default=None)
     replay.add_argument("--exit-model", default="leader_exit", choices=["leader_exit", "resolution_exit", "risk_exit"])
+    replay.add_argument("--export-csv", action="store_true")
+    replay.add_argument("--quality-warnings", action="store_true")
     replay.set_defaults(func=cmd_wallet_flow_replay)
     score = wallet_sub.add_parser("score")
     score.add_argument("--wallet", required=True)

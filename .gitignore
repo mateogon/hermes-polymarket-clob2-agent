@@ -8,6 +8,7 @@ __pycache__/
 data/
 logs/
 external_repos/
+artifacts/
 
 # Beads / Dolt files (added by bd init)
 .dolt/

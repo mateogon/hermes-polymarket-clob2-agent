@@ -65,12 +65,19 @@ Wallet replay commands:
 
 Replay now reads persisted wallet trades from SQLite. Run `wallet-flow fetch` first; replay refuses clearly if there are no stored trades for that wallet. Output is labeled `historical_approx` unless backed by locally recorded L2 snapshots. In this mode, entry prices are approximated from public wallet trades, not executable L2 orderbooks, so slippage is not reliable yet.
 
+Backfill and quality-export variants:
+
+```bash
+.venv/bin/python -m hermes_polymarket.cli wallet-flow fetch --wallet coinman2 --page-size 100 --max-pages 10 --limit-total 1000
+.venv/bin/python -m hermes_polymarket.cli wallet-flow replay --wallet coinman2 --delay 0,2,5,15,30,120,600 --mode historical-approx --exit-model leader_exit --amount 5 --export-csv --quality-warnings
+```
+
 Each replay also writes:
 
 - `wallet_replay_runs` and `wallet_replay_trades`
 - a `strategy_experiments` row
 - inactive candidate memories when enough evidence exists
-- artifacts under `artifacts/runs/<run_id>/`
+- artifacts under `artifacts/runs/<run_id>/`, including `manifest.json`; with `--export-csv`, replay also writes CSVs for trades, delay metrics, skipped reasons, and PnL by category
 
 `resolution_exit` and `risk_exit` are intentionally honest placeholders in historical-approx mode: they return pending reasons until resolution data or local price paths are available.
 
