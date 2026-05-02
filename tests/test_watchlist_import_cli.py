@@ -1,6 +1,7 @@
 import json
 
 from hermes_polymarket.cli import main
+from hermes_polymarket.crypto.watchlist_seeding import WatchlistSeed
 
 
 def test_watchlist_import_cli(tmp_path, monkeypatch, capsys):
@@ -84,3 +85,79 @@ markets:
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "dry_run"
     assert payload["disabled"] == ["condition"]
+
+
+def test_watchlist_add_current_window_cli(tmp_path, monkeypatch, capsys):
+    db_path = tmp_path / "x.sqlite3"
+    monkeypatch.setenv("HERMES_DATABASE_PATH", str(db_path))
+
+    def fake_seed(**_kwargs):
+        return WatchlistSeed(
+            condition_id="condition",
+            slug="btc-window",
+            question="BTC window",
+            symbol="btcusdt",
+            yes_token_id="yes-token",
+            no_token_id="no-token",
+            up_token_id="yes-token",
+            down_token_id="no-token",
+            reference_price=100.0,
+            window_start_ts=1000,
+            window_end_ts=1900,
+            consensus_sources=("binance_rest", "coinbase_rest"),
+            max_deviation_pct=0.01,
+        )
+
+    monkeypatch.setattr("hermes_polymarket.crypto.watchlist_seeding.seed_current_window_from_slug", fake_seed)
+
+    assert (
+        main(
+            [
+                "crypto-latency",
+                "watchlist",
+                "add-current-window",
+                "--slug",
+                "btc-window",
+                "--symbol",
+                "btcusdt",
+                "--yes-direction",
+                "up",
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "added_current_window"
+    assert payload["seed"]["reference_price"] == 100.0
+    assert payload["watchlist"][0]["up_token_id"] == "yes-token"
+    assert "reference_price" in payload["watchlist"][0]["raw_json"]
+
+
+def test_watchlist_add_current_window_cli_reports_seed_failure(tmp_path, monkeypatch, capsys):
+    db_path = tmp_path / "x.sqlite3"
+    monkeypatch.setenv("HERMES_DATABASE_PATH", str(db_path))
+
+    def fake_seed(**_kwargs):
+        raise ValueError("Gamma returned no market for slug: missing")
+
+    monkeypatch.setattr("hermes_polymarket.crypto.watchlist_seeding.seed_current_window_from_slug", fake_seed)
+
+    code = main(
+        [
+            "crypto-latency",
+            "watchlist",
+            "add-current-window",
+            "--slug",
+            "missing",
+            "--symbol",
+            "btcusdt",
+            "--yes-direction",
+            "up",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert payload["status"] == "seed_failed"
+    assert "Gamma returned no market" in payload["reason"]

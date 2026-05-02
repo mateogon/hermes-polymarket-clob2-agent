@@ -986,6 +986,55 @@ def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
             )
             rows = crypto_market_watchlist(db, active_only=False, limit=args.limit)
             print(json.dumps({"mode": "measurement_paper_only", "status": "added", "watchlist": rows}, indent=2, sort_keys=True))
+        elif args.watchlist_action == "add-current-window":
+            from hermes_polymarket.crypto.watchlist_seeding import seed_current_window_from_slug
+
+            try:
+                seed = seed_current_window_from_slug(
+                    slug=args.slug,
+                    symbol=args.symbol,
+                    yes_direction=args.yes_direction,
+                    duration_seconds=args.duration_seconds,
+                    min_sources=args.min_sources,
+                    max_deviation_pct=args.max_deviation_pct,
+                )
+            except ValueError as exc:
+                print(
+                    json.dumps(
+                        {
+                            "mode": "measurement_paper_only",
+                            "status": "seed_failed",
+                            "slug": args.slug,
+                            "reason": str(exc),
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                return 2
+            upsert_crypto_market_watchlist(db, seed.to_watchlist_row())
+            rows = crypto_market_watchlist(db, active_only=False, limit=args.limit)
+            print(
+                json.dumps(
+                    {
+                        "mode": "measurement_paper_only",
+                        "status": "added_current_window",
+                        "seed": {
+                            "condition_id": seed.condition_id,
+                            "slug": seed.slug,
+                            "symbol": seed.symbol,
+                            "reference_price": seed.reference_price,
+                            "window_start_ts": seed.window_start_ts,
+                            "window_end_ts": seed.window_end_ts,
+                            "consensus_sources": list(seed.consensus_sources),
+                            "max_deviation_pct": seed.max_deviation_pct,
+                        },
+                        "watchlist": rows,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
         elif args.watchlist_action == "import":
             if yaml is None:
                 print("pyyaml is required for watchlist import")
@@ -2148,6 +2197,13 @@ def build_parser() -> argparse.ArgumentParser:
     watchlist_add.add_argument("--down-token-id", default=None)
     watchlist_add.add_argument("--yes-direction", choices=["up", "down"], default=None)
     watchlist_add.add_argument("--question", default=None)
+    watchlist_add_current = watchlist_sub.add_parser("add-current-window")
+    watchlist_add_current.add_argument("--slug", required=True)
+    watchlist_add_current.add_argument("--symbol", default=None, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    watchlist_add_current.add_argument("--duration-seconds", type=int, default=900)
+    watchlist_add_current.add_argument("--yes-direction", choices=["up", "down"], required=True)
+    watchlist_add_current.add_argument("--min-sources", type=int, default=2)
+    watchlist_add_current.add_argument("--max-deviation-pct", type=float, default=0.25)
     watchlist_clear = watchlist_sub.add_parser("clear")
     watchlist_import = watchlist_sub.add_parser("import")
     watchlist_import.add_argument("--file", required=True)
