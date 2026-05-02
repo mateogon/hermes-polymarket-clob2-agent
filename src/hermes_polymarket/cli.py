@@ -692,18 +692,50 @@ def cmd_learning_retire(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_crypto_latency_discover(_: argparse.Namespace) -> int:
-    from hermes_polymarket.storage.crypto_latency import crypto_latency_report
+def cmd_crypto_latency_discover(args: argparse.Namespace) -> int:
+    from hermes_polymarket.crypto.market_resolver import market_window_from_gamma_market
+    from hermes_polymarket.data_sources.base import now_ms
+    from hermes_polymarket.polymarket.gamma_client import GammaClient
+    from hermes_polymarket.storage.crypto_latency import crypto_latency_report, insert_crypto_market_window
+    from hermes_polymarket.storage.crypto_watchlist import upsert_crypto_market_watchlist
 
     settings = _settings()
     db = Database(settings.database_path)
     db.init_schema(settings.initial_bankroll)
+    gamma = GammaClient()
     try:
+        query_terms = args.query or ["bitcoin up down", "ethereum up down", "solana up down", "xrp up down"]
+        discovered: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for query in query_terms:
+            for market in gamma.search_markets(query, limit=args.max_markets):
+                window = market_window_from_gamma_market(market)
+                if window is None:
+                    continue
+                window["discovered_at_ms"] = now_ms()
+                window["raw"] = market
+                key = (window["condition_id"], window["yes_token_id"], window["no_token_id"])
+                discovered[key] = window
+
+        for row in discovered.values():
+            insert_crypto_market_window(db, row)
+            upsert_crypto_market_watchlist(db, row)
+
         payload = crypto_latency_report(db)
-        payload["status"] = "discover_skeleton"
-        payload["message"] = "Crypto market discovery is measurement-only; no live trading or order posting is implemented."
+        payload["status"] = "measurement_only"
+        payload["discovered"] = len(discovered)
+        payload["markets"] = [
+            {
+                "condition_id": row["condition_id"],
+                "slug": row["slug"],
+                "symbol": row["symbol"],
+                "yes_token_id": row["yes_token_id"],
+                "no_token_id": row["no_token_id"],
+            }
+            for row in discovered.values()
+        ]
         print(json.dumps(payload, indent=2, sort_keys=True))
     finally:
+        gamma.close()
         db.close()
     return 0
 
@@ -752,6 +784,7 @@ def cmd_crypto_latency_record(args: argparse.Namespace) -> int:
         async def run_recording() -> dict[str, Any]:
             bus = EventBus()
             tasks: list[asyncio.Task[None]] = []
+            market_ws_token_count = 0
             if args.fixture:
                 await publish_fixture_crypto_events(bus)
             else:
@@ -760,6 +793,9 @@ def cmd_crypto_latency_record(args: argparse.Namespace) -> int:
                 from hermes_polymarket.data_sources.kraken_stream import run_kraken_ticker
                 if not args.disable_rtds:
                     from hermes_polymarket.data_sources.polymarket_rtds import run_polymarket_rtds_crypto
+                if args.use_watchlist:
+                    from hermes_polymarket.data_sources.polymarket_market_ws import run_polymarket_market_ws
+                    from hermes_polymarket.storage.crypto_watchlist import watchlist_token_ids
 
                 coinbase_products = tuple(symbol.replace("usdt", "-USD").upper() for symbol in symbols)
                 kraken_symbols = tuple(symbol.replace("usdt", "/USD").upper() for symbol in symbols)
@@ -770,6 +806,11 @@ def cmd_crypto_latency_record(args: argparse.Namespace) -> int:
                 ]
                 if not args.disable_rtds:
                     tasks.append(asyncio.create_task(run_polymarket_rtds_crypto(bus, symbols=symbols)))
+                if args.use_watchlist:
+                    token_ids = watchlist_token_ids(db, active_only=True, limit=args.max_watchlist_markets)
+                    market_ws_token_count = len(token_ids)
+                    if token_ids:
+                        tasks.append(asyncio.create_task(run_polymarket_market_ws(bus, asset_ids=token_ids)))
             try:
                 summary = await run_crypto_latency_recorder(
                     db=db,
@@ -794,6 +835,8 @@ def cmd_crypto_latency_record(args: argparse.Namespace) -> int:
                 "mode": "measurement_paper_only",
                 "data_quality": "paper_live" if not args.fixture else "local_observation",
                 "fixture": args.fixture,
+                "use_watchlist": args.use_watchlist,
+                "watchlist_token_count": market_ws_token_count,
                 "symbols": symbols,
                 "summary": summary.to_dict(),
                 "report": crypto_latency_report(db),
@@ -829,6 +872,20 @@ def cmd_crypto_latency_source_health(_: argparse.Namespace) -> int:
     try:
         rows = [dict(row) for row in db.source_health()]
         print(json.dumps({"mode": "measurement_paper_only", "source_health": rows}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
+    from hermes_polymarket.storage.crypto_watchlist import crypto_market_watchlist
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        rows = crypto_market_watchlist(db, active_only=not args.all, limit=args.limit)
+        print(json.dumps({"mode": "measurement_paper_only", "watchlist": rows}, indent=2, sort_keys=True))
     finally:
         db.close()
     return 0
@@ -1101,6 +1158,8 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_latency = sub.add_parser("crypto-latency")
     crypto_sub = crypto_latency.add_subparsers(dest="crypto_latency_command", required=True)
     crypto_discover = crypto_sub.add_parser("discover")
+    crypto_discover.add_argument("--max-markets", type=int, default=20)
+    crypto_discover.add_argument("--query", action="append", help="Gamma search query; may be repeated")
     crypto_discover.set_defaults(func=cmd_crypto_latency_discover)
     crypto_record = crypto_sub.add_parser("record")
     crypto_record.add_argument("--seconds", type=int, default=300)
@@ -1113,9 +1172,15 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_record.add_argument("--cooldown-ms", type=int, default=5000)
     crypto_record.add_argument("--write-artifacts", action="store_true")
     crypto_record.add_argument("--disable-rtds", action="store_true")
+    crypto_record.add_argument("--use-watchlist", action="store_true")
+    crypto_record.add_argument("--max-watchlist-markets", type=int, default=20)
     crypto_record.set_defaults(func=cmd_crypto_latency_record)
     crypto_report = crypto_sub.add_parser("report")
     crypto_report.set_defaults(func=cmd_crypto_latency_report)
+    crypto_watchlist = crypto_sub.add_parser("watchlist")
+    crypto_watchlist.add_argument("--limit", type=int, default=50)
+    crypto_watchlist.add_argument("--all", action="store_true")
+    crypto_watchlist.set_defaults(func=cmd_crypto_latency_watchlist)
     crypto_health = crypto_sub.add_parser("source-health")
     crypto_health.set_defaults(func=cmd_crypto_latency_source_health)
     crypto_consensus = crypto_sub.add_parser("consensus")

@@ -300,6 +300,22 @@ CREATE TABLE IF NOT EXISTS crypto_market_windows (
   UNIQUE(condition_id, yes_token_id, no_token_id)
 );
 
+CREATE TABLE IF NOT EXISTS crypto_market_watchlist (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  condition_id TEXT NOT NULL,
+  slug TEXT NOT NULL,
+  question TEXT,
+  symbol TEXT NOT NULL,
+  yes_token_id TEXT NOT NULL,
+  no_token_id TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  discovered_at_ms INTEGER NOT NULL,
+  end_ts_ms INTEGER,
+  raw_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(condition_id, yes_token_id, no_token_id)
+);
+
 CREATE TABLE IF NOT EXISTS crypto_consensus_ticks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   symbol TEXT NOT NULL,

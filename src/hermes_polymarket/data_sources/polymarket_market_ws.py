@@ -98,10 +98,30 @@ async def run_polymarket_market_ws(
         try:
             async with websockets.connect(POLY_MARKET_WS, ping_interval=None) as ws:
                 await ws.send(json.dumps(subscription))
+                await bus.publish(
+                    DataEvent(
+                        source="polymarket_market_ws",
+                        event_type=EventType.SOURCE_HEALTH,
+                        event_ts_ms=None,
+                        received_ts_ms=now_ms(),
+                        key="connected",
+                        payload={"ok": True, "asset_count": len(subscription["assets_ids"])},
+                    )
+                )
                 keepalive = asyncio.create_task(_keepalive(ws))
                 try:
                     async for raw in ws:
                         if raw == "PONG":
+                            await bus.publish(
+                                DataEvent(
+                                    source="polymarket_market_ws",
+                                    event_type=EventType.SOURCE_HEALTH,
+                                    event_ts_ms=None,
+                                    received_ts_ms=now_ms(),
+                                    key="pong",
+                                    payload={"ok": True},
+                                )
+                            )
                             continue
                         for event in normalize_market_ws_payload(json.loads(raw)):
                             await bus.publish(event)

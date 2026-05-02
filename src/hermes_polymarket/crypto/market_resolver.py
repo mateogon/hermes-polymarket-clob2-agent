@@ -7,7 +7,10 @@ automation; local L2 replay can make this stricter later.
 
 from __future__ import annotations
 
+import json
 from typing import Any
+
+from hermes_polymarket.crypto.crypto_market_classifier import infer_symbol_from_text, is_short_duration_crypto_market
 
 
 SYMBOL_KEYWORDS = {
@@ -19,22 +22,46 @@ SYMBOL_KEYWORDS = {
 
 
 def infer_crypto_symbol(text: str) -> str | None:
-    lowered = text.lower()
-    for symbol, keywords in SYMBOL_KEYWORDS.items():
-        if any(keyword in lowered for keyword in keywords):
-            return symbol
+    return infer_symbol_from_text(text)
+
+
+def _coerce_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _token_ids(market: dict[str, Any]) -> tuple[str, str] | None:
+    tokens = _coerce_list(market.get("tokens"))
+    if len(tokens) >= 2:
+        first = tokens[0]
+        second = tokens[1]
+        yes_token = str(first.get("token_id") or first.get("id") if isinstance(first, dict) else first)
+        no_token = str(second.get("token_id") or second.get("id") if isinstance(second, dict) else second)
+        if yes_token and no_token:
+            return yes_token, no_token
+    clob_tokens = _coerce_list(market.get("clobTokenIds") or market.get("clob_token_ids"))
+    if len(clob_tokens) >= 2:
+        return str(clob_tokens[0]), str(clob_tokens[1])
     return None
 
 
 def market_window_from_gamma_market(market: dict[str, Any]) -> dict[str, Any] | None:
     slug = str(market.get("slug") or "")
     question = str(market.get("question") or market.get("title") or "")
-    symbol = infer_crypto_symbol(f"{slug} {question}")
-    tokens = market.get("tokens") or market.get("clobTokenIds") or []
-    if symbol is None or not isinstance(tokens, list) or len(tokens) < 2:
+    if not is_short_duration_crypto_market(question, slug):
         return None
-    yes_token = str(tokens[0].get("token_id") if isinstance(tokens[0], dict) else tokens[0])
-    no_token = str(tokens[1].get("token_id") if isinstance(tokens[1], dict) else tokens[1])
+    symbol = infer_crypto_symbol(f"{slug} {question}")
+    tokens = _token_ids(market)
+    if symbol is None or tokens is None:
+        return None
+    yes_token, no_token = tokens
     condition_id = str(market.get("conditionId") or market.get("condition_id") or "")
     if not condition_id or not yes_token or not no_token:
         return None

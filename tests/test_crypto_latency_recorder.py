@@ -4,6 +4,7 @@ from hermes_polymarket.crypto.latency_recorder import RecorderConfig, run_crypto
 from hermes_polymarket.data_sources.base import DataEvent, EventType
 from hermes_polymarket.data_sources.event_bus import EventBus
 from hermes_polymarket.storage.crypto_latency import crypto_latency_report
+from hermes_polymarket.storage.crypto_watchlist import upsert_crypto_market_watchlist
 from hermes_polymarket.storage.db import Database
 
 
@@ -68,3 +69,23 @@ def test_crypto_latency_recorder_ignores_unconfigured_symbols(tmp_path):
         db.close()
 
     asyncio.run(run())
+
+
+def test_crypto_watchlist_schema_available(tmp_path):
+    db = Database(tmp_path / "x.sqlite")
+    db.init_schema(1000)
+    upsert_crypto_market_watchlist(
+        db,
+        {
+            "condition_id": "c",
+            "slug": "btc-15m",
+            "question": "Bitcoin up or down in 15 minutes?",
+            "symbol": "btcusdt",
+            "yes_token_id": "y",
+            "no_token_id": "n",
+            "discovered_at_ms": 1,
+        },
+    )
+    count = db.conn.execute("SELECT COUNT(*) AS n FROM crypto_market_watchlist").fetchone()["n"]
+    assert count == 1
+    db.close()
