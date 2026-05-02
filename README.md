@@ -54,6 +54,17 @@ Wallet-flow metrics report:
 .venv/bin/python -m hermes_polymarket.cli wallet-flow report
 ```
 
+Wallet replay commands:
+
+```bash
+.venv/bin/python -m hermes_polymarket.cli wallet-flow fetch --wallet coinman2 --limit 100
+.venv/bin/python -m hermes_polymarket.cli wallet-flow replay --wallet coinman2 --delay 0,2,5,15,30,120,600 --mode historical-approx
+.venv/bin/python -m hermes_polymarket.cli wallet-flow score --wallet coinman2
+.venv/bin/python -m hermes_polymarket.cli wallet-flow leaderboard
+```
+
+Replay output is labeled `historical_approx` unless backed by locally recorded L2 snapshots.
+
 Live gate check, expected to refuse by default:
 
 ```bash
@@ -72,6 +83,29 @@ The data-source layer normalizes public events into `DataEvent` records before t
 Signals remain signal-only. Wallet flow can produce paper-copy candidates, but it cannot place live orders.
 
 Wallet-flow reporting is entry-copyability only until an exit model exists. The report intentionally marks PnL as `not_computed_no_exit_model`; paper PnL should only be interpreted after a leader-exit, TP/SL/timeout, or resolution-payout model is implemented.
+
+## Learning Loop
+
+The agent learns through an auditable research loop, not by self-training or changing live code:
+
+```text
+observe -> journal -> evaluate -> reflect -> hypothesize -> replay -> paper -> promote/reject
+```
+
+Learning records store code commit, config hash, market snapshots, source health, risk decision, final action, and human-readable rationale. Reflections and memories can create candidate rules, but promotion is paper-only and requires explicit human approval.
+
+Learning commands:
+
+```bash
+.venv/bin/python -m hermes_polymarket.cli learning daily-report
+.venv/bin/python -m hermes_polymarket.cli learning weekly-review
+.venv/bin/python -m hermes_polymarket.cli learning hypotheses
+.venv/bin/python -m hermes_polymarket.cli learning memories search --query coinman2
+.venv/bin/python -m hermes_polymarket.cli learning promote-candidate --rule-id RULE_ID --paper-only --human-approved
+.venv/bin/python -m hermes_polymarket.cli learning retire-rule --rule-id RULE_ID
+```
+
+Learning modules cannot activate live rules, modify live execution, or raise live risk caps. Live promotion is intentionally unsupported.
 
 ## Reference Repos Cloned
 

@@ -114,6 +114,200 @@ def cmd_wallet_flow_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_wallet_flow_fetch(args: argparse.Namespace) -> int:
+    from hermes_polymarket.data_sources.polymarket_data_api import PolymarketDataApi
+    from hermes_polymarket.data_sources.wallet_registry import WalletRegistry
+
+    registry = WalletRegistry.load()
+    wallet = registry.by_name(args.wallet)
+    client = PolymarketDataApi()
+    try:
+        trades = client.get_trades_for_wallet(wallet.address, limit=args.limit, min_cash=args.min_cash)
+        print(json.dumps({"wallet": wallet.name, "address": wallet.address, "trades": [trade.raw for trade in trades]}, indent=2, sort_keys=True))
+    finally:
+        client.close()
+    return 0
+
+
+def cmd_wallet_flow_replay(args: argparse.Namespace) -> int:
+    from hermes_polymarket.backtest.wallet_replay import replay_wallet_trades
+    from hermes_polymarket.backtest.wallet_replay_models import ReplayRunConfig
+    from hermes_polymarket.backtest.wallet_replay_storage import insert_replay_run, insert_replay_trade
+    from hermes_polymarket.data_sources.wallet_registry import WalletRegistry
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        wallet = WalletRegistry.load().by_name(args.wallet)
+        delays = tuple(int(value) for value in args.delay.split(",") if value.strip())
+        config = ReplayRunConfig(wallet=wallet.address, delays_seconds=delays, mode=args.mode.replace("-", "_"), paper_amount_usd=args.amount)
+        run_id, results, summary = replay_wallet_trades([], config)
+        insert_replay_run(
+            db,
+            run_id=run_id,
+            wallet=wallet.address,
+            mode=config.mode,
+            data_quality=config.data_quality,
+            delays=list(config.delays_seconds),
+            config={"wallet_name": wallet.name, "amount": args.amount},
+            metrics=summary,
+        )
+        for result in results:
+            insert_replay_trade(db, result.to_storage_dict())
+        print(json.dumps({"run_id": run_id, "wallet": wallet.name, "summary": summary}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_wallet_flow_score(args: argparse.Namespace) -> int:
+    from hermes_polymarket.backtest.wallet_replay_models import ExitModel, ReplayTradeResult
+    from hermes_polymarket.backtest.wallet_replay_storage import replay_trades
+    from hermes_polymarket.data_sources.wallet_registry import WalletRegistry
+    from hermes_polymarket.signals.wallet_score import score_wallet
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        wallet = WalletRegistry.load().by_name(args.wallet)
+        rows = replay_trades(db)
+        results = [
+            ReplayTradeResult(
+                replay_trade_id=row["replay_trade_id"],
+                run_id=row["run_id"],
+                wallet=row["wallet"],
+                condition_id=row["condition_id"],
+                asset_id=row["asset_id"],
+                outcome=row["outcome"],
+                delay_seconds=int(row["delay_seconds"]),
+                exit_model=ExitModel(row["exit_model"]),
+                status=row["status"],
+                pnl=row["pnl"],
+                roi=row["roi"],
+                worse_entry_cents=row["worse_entry_cents"],
+                skipped_reason=row["skipped_reason"],
+                category=row["category"],
+            )
+            for row in rows
+            if row["wallet"].lower() == wallet.address.lower()
+        ]
+        score = score_wallet(wallet.address, results)
+        print(json.dumps({"wallet": wallet.name, "score": score.score, "components": score.components, "sample_size": score.sample_size}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_wallet_flow_leaderboard(_: argparse.Namespace) -> int:
+    from hermes_polymarket.backtest.wallet_replay_storage import replay_trades
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        wallets = sorted({row["wallet"] for row in replay_trades(db)})
+        print(json.dumps({"wallets": wallets}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def _learning_db() -> tuple[Database, object]:
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    return db, settings
+
+
+def cmd_learning_daily(_: argparse.Namespace) -> int:
+    from hermes_polymarket.learning.reports import daily_report, render_report
+
+    db, _ = _learning_db()
+    try:
+        print(render_report(daily_report(db)))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_learning_weekly(_: argparse.Namespace) -> int:
+    from hermes_polymarket.learning.reports import render_report, weekly_review
+
+    db, _ = _learning_db()
+    try:
+        print(render_report(weekly_review(db)))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_learning_hypotheses(args: argparse.Namespace) -> int:
+    from hermes_polymarket.learning.decision_journal import DecisionJournal
+
+    db, _ = _learning_db()
+    try:
+        rows = [dict(row) for row in DecisionJournal(db).hypotheses(status=args.status)]
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_learning_memory_search(args: argparse.Namespace) -> int:
+    from hermes_polymarket.learning.memory_store import MemoryStore
+
+    db, _ = _learning_db()
+    try:
+        rows = [
+            dict(row)
+            for row in MemoryStore(db).search(
+                query=args.query,
+                memory_type=args.memory_type,
+                strategy_id=args.strategy_id,
+                wallet=args.wallet,
+                market_category=args.market_category,
+            )
+        ]
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_learning_promote(args: argparse.Namespace) -> int:
+    from hermes_polymarket.learning.memory_store import MemoryStore
+    from hermes_polymarket.learning.promotion import promote_candidate_to_paper
+
+    db, _ = _learning_db()
+    try:
+        record = promote_candidate_to_paper(
+            MemoryStore(db),
+            rule_id=args.rule_id,
+            human_approved=args.human_approved,
+            paper_only=args.paper_only,
+            reason=args.reason,
+        )
+        print(json.dumps(record.content, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_learning_retire(args: argparse.Namespace) -> int:
+    from hermes_polymarket.learning.memory_store import MemoryStore
+    from hermes_polymarket.learning.promotion import retire_rule
+
+    db, _ = _learning_db()
+    try:
+        record = retire_rule(MemoryStore(db), rule_id=args.rule_id, reason=args.reason)
+        print(json.dumps(record.content, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hermes-polymarket")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -138,9 +332,54 @@ def build_parser() -> argparse.ArgumentParser:
 
     wallet_flow = sub.add_parser("wallet-flow")
     wallet_sub = wallet_flow.add_subparsers(dest="wallet_command", required=True)
+    fetch = wallet_sub.add_parser("fetch")
+    fetch.add_argument("--wallet", required=True)
+    fetch.add_argument("--limit", type=int, default=100)
+    fetch.add_argument("--min-cash", type=float, default=None)
+    fetch.set_defaults(func=cmd_wallet_flow_fetch)
+    replay = wallet_sub.add_parser("replay")
+    replay.add_argument("--wallet", required=True)
+    replay.add_argument("--delay", default="0,2,5,15,30,120,600")
+    replay.add_argument("--mode", default="historical-approx", choices=["historical-approx", "local-l2"])
+    replay.add_argument("--amount", type=float, default=5.0)
+    replay.set_defaults(func=cmd_wallet_flow_replay)
+    score = wallet_sub.add_parser("score")
+    score.add_argument("--wallet", required=True)
+    score.set_defaults(func=cmd_wallet_flow_score)
+    leaderboard = wallet_sub.add_parser("leaderboard")
+    leaderboard.set_defaults(func=cmd_wallet_flow_leaderboard)
     report = wallet_sub.add_parser("report")
     report.add_argument("--wallet", default=None)
     report.set_defaults(func=cmd_wallet_flow_report)
+
+    learning = sub.add_parser("learning")
+    learning_sub = learning.add_subparsers(dest="learning_command", required=True)
+    daily = learning_sub.add_parser("daily-report")
+    daily.set_defaults(func=cmd_learning_daily)
+    weekly = learning_sub.add_parser("weekly-review")
+    weekly.set_defaults(func=cmd_learning_weekly)
+    hypotheses = learning_sub.add_parser("hypotheses")
+    hypotheses.add_argument("--status", default=None)
+    hypotheses.set_defaults(func=cmd_learning_hypotheses)
+    memories = learning_sub.add_parser("memories")
+    memories_sub = memories.add_subparsers(dest="memories_command", required=True)
+    mem_search = memories_sub.add_parser("search")
+    mem_search.add_argument("--query", default=None)
+    mem_search.add_argument("--memory-type", default=None, choices=["episodic", "semantic", "procedural"])
+    mem_search.add_argument("--strategy-id", default=None)
+    mem_search.add_argument("--wallet", default=None)
+    mem_search.add_argument("--market-category", default=None)
+    mem_search.set_defaults(func=cmd_learning_memory_search)
+    promote = learning_sub.add_parser("promote-candidate")
+    promote.add_argument("--rule-id", required=True)
+    promote.add_argument("--paper-only", action="store_true")
+    promote.add_argument("--human-approved", action="store_true")
+    promote.add_argument("--reason", default="human approved paper promotion")
+    promote.set_defaults(func=cmd_learning_promote)
+    retire = learning_sub.add_parser("retire-rule")
+    retire.add_argument("--rule-id", required=True)
+    retire.add_argument("--reason", default="retired by operator")
+    retire.set_defaults(func=cmd_learning_retire)
 
     dry = sub.add_parser("dry-run")
     dry.add_argument("--market", default=None, help="Market identifier: slug, condition ID, token ID, or search text")
