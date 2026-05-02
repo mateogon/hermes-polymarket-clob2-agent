@@ -217,6 +217,57 @@ CREATE TABLE IF NOT EXISTS wallet_observed_trades (
   UNIQUE(wallet, tx_hash, condition_id, asset_id, side, timestamp)
 );
 
+CREATE TABLE IF NOT EXISTS wallet_current_positions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  wallet TEXT NOT NULL,
+  condition_id TEXT NOT NULL,
+  asset_id TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  size REAL NOT NULL,
+  avg_price REAL NOT NULL,
+  initial_value REAL NOT NULL,
+  current_value REAL NOT NULL,
+  cash_pnl REAL NOT NULL,
+  percent_pnl REAL NOT NULL,
+  total_bought REAL NOT NULL,
+  realized_pnl REAL NOT NULL,
+  cur_price REAL NOT NULL,
+  redeemable INTEGER NOT NULL DEFAULT 0,
+  mergeable INTEGER NOT NULL DEFAULT 0,
+  negative_risk INTEGER NOT NULL DEFAULT 0,
+  opposite_asset TEXT,
+  opposite_outcome TEXT,
+  slug TEXT,
+  title TEXT,
+  event_slug TEXT,
+  end_date TEXT,
+  raw_json TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(wallet, condition_id, asset_id)
+);
+
+CREATE TABLE IF NOT EXISTS wallet_closed_positions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  wallet TEXT NOT NULL,
+  condition_id TEXT NOT NULL,
+  asset_id TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  avg_price REAL NOT NULL,
+  total_bought REAL NOT NULL,
+  realized_pnl REAL NOT NULL,
+  cur_price REAL NOT NULL,
+  timestamp INTEGER NOT NULL,
+  opposite_asset TEXT,
+  opposite_outcome TEXT,
+  slug TEXT,
+  title TEXT,
+  event_slug TEXT,
+  end_date TEXT,
+  raw_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(wallet, condition_id, asset_id, timestamp)
+);
+
 CREATE TABLE IF NOT EXISTS wallet_scores (
   wallet TEXT PRIMARY KEY,
   score REAL NOT NULL,

@@ -328,6 +328,104 @@ def cmd_wallet_flow_exit_coverage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _position_pages(page_size: int, max_pages: int) -> list[tuple[int, int]]:
+    return [(page * page_size, page_size) for page in range(max_pages)]
+
+
+def cmd_wallet_flow_positions_fetch(args: argparse.Namespace) -> int:
+    from hermes_polymarket.data_sources.polymarket_positions_api import PolymarketPositionsApi
+    from hermes_polymarket.data_sources.wallet_registry import WalletRegistry
+    from hermes_polymarket.storage.wallet_positions import insert_closed_positions, upsert_current_positions
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    wallet = WalletRegistry.load().by_name(args.wallet)
+    client = PolymarketPositionsApi()
+    try:
+        pages = []
+        fetched_total = 0
+        inserted_total = 0
+        duplicate_total = 0
+        for offset, limit in _position_pages(args.page_size, args.max_pages):
+            if args.kind == "current":
+                rows = client.current_positions(wallet.address, market=args.market, limit=limit, offset=offset)
+                inserted = upsert_current_positions(db, rows)
+                duplicates = 0
+            else:
+                rows = client.closed_positions(wallet.address, market=args.market, limit=limit, offset=offset)
+                counts = insert_closed_positions(db, rows)
+                inserted = counts["inserted"]
+                duplicates = counts["duplicates"]
+            pages.append({"offset": offset, "fetched": len(rows), "inserted": inserted, "duplicates": duplicates})
+            fetched_total += len(rows)
+            inserted_total += inserted
+            duplicate_total += duplicates
+            if len(rows) < limit:
+                break
+        print(
+            json.dumps(
+                {
+                    "wallet": wallet.name,
+                    "address": wallet.address,
+                    "kind": args.kind,
+                    "fetched_count": fetched_total,
+                    "inserted_count": inserted_total,
+                    "duplicate_count": duplicate_total,
+                    "pages": pages,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    finally:
+        client.close()
+        db.close()
+    return 0
+
+
+def cmd_wallet_flow_positions_current(args: argparse.Namespace) -> int:
+    from hermes_polymarket.data_sources.wallet_registry import WalletRegistry
+    from hermes_polymarket.storage.wallet_positions import current_positions
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        wallet = WalletRegistry.load().by_name(args.wallet)
+        print(json.dumps({"wallet": wallet.name, "positions": current_positions(db, wallet.address)[: args.limit]}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_wallet_flow_positions_report(args: argparse.Namespace) -> int:
+    from hermes_polymarket.backtest.position_report import closed_position_report, current_position_report, trade_position_coverage
+    from hermes_polymarket.backtest.wallet_replay_storage import wallet_trades
+    from hermes_polymarket.data_sources.wallet_registry import WalletRegistry
+    from hermes_polymarket.storage.wallet_positions import closed_positions, current_positions
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        wallet = WalletRegistry.load().by_name(args.wallet)
+        current_rows = current_positions(db, wallet.address)
+        closed_rows = closed_positions(db, wallet.address, limit=args.limit)
+        trade_rows = [trade.__dict__ for trade in wallet_trades(db, wallet.address, limit=args.trade_limit)]
+        payload = {
+            "wallet": wallet.name,
+            "address": wallet.address,
+            "current": current_position_report(current_rows),
+            "closed": closed_position_report(closed_rows),
+            "trade_position_coverage": trade_position_coverage(trade_rows, current_rows, closed_rows),
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
 def _git_commit_sha() -> str:
     try:
         return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True).strip()
@@ -650,6 +748,24 @@ def build_parser() -> argparse.ArgumentParser:
     report = wallet_sub.add_parser("report")
     report.add_argument("--wallet", default=None)
     report.set_defaults(func=cmd_wallet_flow_report)
+    positions = wallet_sub.add_parser("positions")
+    positions_sub = positions.add_subparsers(dest="positions_command", required=True)
+    positions_fetch = positions_sub.add_parser("fetch")
+    positions_fetch.add_argument("--wallet", required=True)
+    positions_fetch.add_argument("--kind", required=True, choices=["current", "closed"])
+    positions_fetch.add_argument("--market", default=None)
+    positions_fetch.add_argument("--page-size", type=int, default=50)
+    positions_fetch.add_argument("--max-pages", type=int, default=10)
+    positions_fetch.set_defaults(func=cmd_wallet_flow_positions_fetch)
+    positions_report = positions_sub.add_parser("report")
+    positions_report.add_argument("--wallet", required=True)
+    positions_report.add_argument("--limit", type=int, default=1000)
+    positions_report.add_argument("--trade-limit", type=int, default=5000)
+    positions_report.set_defaults(func=cmd_wallet_flow_positions_report)
+    positions_current = positions_sub.add_parser("current")
+    positions_current.add_argument("--wallet", required=True)
+    positions_current.add_argument("--limit", type=int, default=50)
+    positions_current.set_defaults(func=cmd_wallet_flow_positions_current)
 
     learning = sub.add_parser("learning")
     learning_sub = learning.add_subparsers(dest="learning_command", required=True)

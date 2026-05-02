@@ -4,7 +4,9 @@ import hermes_polymarket.cli as cli
 from hermes_polymarket.backtest.wallet_replay_storage import insert_wallet_trades
 from hermes_polymarket.config import load_settings
 from hermes_polymarket.data_sources.polymarket_data_api import WalletTrade
+from hermes_polymarket.data_sources.polymarket_positions_api import ClosedPosition, CurrentPosition
 from hermes_polymarket.storage.db import Database
+from hermes_polymarket.storage.wallet_positions import insert_closed_positions, upsert_current_positions
 
 
 WALLET = "0x55be7aa03ecfbe37aa5460db791205f7ac9ddca3"
@@ -134,3 +136,71 @@ def test_wallet_exit_coverage_cli_uses_persisted_trades(monkeypatch, tmp_path, c
     assert cli.main(["wallet-flow", "exit-coverage", "--wallet", "coinman2"]) == 0
     output = capsys.readouterr().out
     assert '"buy_assets_with_sell": 1' in output
+
+
+def _current_position():
+    return CurrentPosition(
+        wallet=WALLET,
+        asset_id="a",
+        condition_id="c",
+        size=10,
+        avg_price=0.4,
+        initial_value=4,
+        current_value=5,
+        cash_pnl=1,
+        percent_pnl=25,
+        total_bought=100,
+        realized_pnl=0,
+        cur_price=0.5,
+        redeemable=False,
+        mergeable=False,
+        title="title",
+        slug="slug",
+        event_slug="event",
+        outcome="Yes",
+        outcome_index=0,
+        opposite_outcome="No",
+        opposite_asset="other",
+        end_date="2026-01-01",
+        negative_risk=False,
+        raw={},
+    )
+
+
+def _closed_position():
+    return ClosedPosition(
+        wallet=WALLET,
+        asset_id="a",
+        condition_id="c",
+        avg_price=0.4,
+        total_bought=100,
+        realized_pnl=12.5,
+        cur_price=1,
+        timestamp=123,
+        title="title",
+        slug="slug",
+        event_slug="event",
+        outcome="Yes",
+        outcome_index=0,
+        opposite_outcome="No",
+        opposite_asset="other",
+        end_date="2026-01-01",
+        raw={},
+    )
+
+
+def test_wallet_positions_cli_report_and_current(monkeypatch, tmp_path, capsys):
+    settings = _patch_settings(monkeypatch, tmp_path)
+    db = Database(settings.database_path)
+    db.init_schema(1000)
+    insert_wallet_trades(db, [_trade("BUY", 100, 0.5)])
+    upsert_current_positions(db, [_current_position()])
+    insert_closed_positions(db, [_closed_position()])
+    db.close()
+
+    assert cli.main(["wallet-flow", "positions", "current", "--wallet", "coinman2"]) == 0
+    assert '"current_value": 5.0' in capsys.readouterr().out
+    assert cli.main(["wallet-flow", "positions", "report", "--wallet", "coinman2"]) == 0
+    output = capsys.readouterr().out
+    assert '"closed_positions": 1' in output
+    assert '"trades_with_current_position": 1' in output
