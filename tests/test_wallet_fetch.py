@@ -41,6 +41,20 @@ def test_paginated_fetch_uses_offsets_and_limit_total():
     client.close()
 
 
+def test_paginated_fetch_passes_side_filter():
+    seen_side = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_side.append(request.url.params["side"])
+        return httpx.Response(200, json=[_row(1)])
+
+    client = PolymarketDataApi(httpx.Client(transport=httpx.MockTransport(handler)))
+    trades = fetch_wallet_trades_paginated(client, wallet=WALLET, page_size=10, max_pages=1, limit_total=10, side="SELL")
+    assert len(trades) == 1
+    assert seen_side == ["SELL"]
+    client.close()
+
+
 def test_paginated_fetch_persists_page_counts(tmp_path):
     def handler(request: httpx.Request) -> httpx.Response:
         offset = int(request.url.params["offset"])

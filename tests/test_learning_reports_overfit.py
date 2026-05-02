@@ -1,4 +1,6 @@
 from hermes_polymarket.learning.overfit_checks import OverfitInputs, overfit_warnings
+from hermes_polymarket.learning.experiments import ExperimentTracker
+from hermes_polymarket.learning.journal_schema import StrategyExperimentRecord
 from hermes_polymarket.learning.reports import daily_report, render_report, weekly_review
 from hermes_polymarket.storage.db import Database
 
@@ -29,4 +31,25 @@ def test_daily_and_weekly_reports_render_empty_database(tmp_path):
     assert daily["signals"]["total"] == 0
     assert daily["safety"]["live_trading_enabled"] is False
     assert "source_health" in render_report(weekly)
+    db.close()
+
+
+def test_daily_report_includes_replay_experiments(tmp_path):
+    db = Database(tmp_path / "learning.sqlite3")
+    db.init_schema(1000)
+    ExperimentTracker(db).record(
+        StrategyExperimentRecord(
+            run_id="run",
+            run_type="wallet_replay",
+            strategy_id="wallet_flow:coinman2",
+            code_commit_sha="abc",
+            config_hash="cfg",
+            data_quality="historical_approx",
+            parameters={},
+            metrics={"replayed_trades": 0, "pending_trades": 10, "quality": {"warnings": ["no_closed_trades"]}},
+        )
+    )
+    report = daily_report(db)
+    assert report["experiments"]["total"] == 1
+    assert report["experiments"]["recent"][0]["quality_warnings"] == ["no_closed_trades"]
     db.close()

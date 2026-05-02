@@ -134,25 +134,37 @@ def cmd_wallet_flow_fetch(args: argparse.Namespace) -> int:
         limit_total = args.limit_total if args.limit_total is not None else args.limit
         page_size = args.page_size if args.page_size is not None else args.limit
         max_pages = args.max_pages if args.max_pages is not None else 1
-        fetch_result = fetch_and_persist_wallet_trades_paginated(
-            db,
-            client,
-            wallet=wallet.address,
-            page_size=page_size,
-            max_pages=max_pages,
-            limit_total=limit_total,
-            min_cash=args.min_cash,
-        )
+        sides = [None] if args.side != "all" else ["BUY", "SELL"]
+        if args.side in {"buy", "sell"}:
+            sides = [args.side.upper()]
+        fetch_results = [
+            fetch_and_persist_wallet_trades_paginated(
+                db,
+                client,
+                wallet=wallet.address,
+                page_size=page_size,
+                max_pages=max_pages,
+                limit_total=limit_total,
+                min_cash=args.min_cash,
+                side=side,
+            )
+            for side in sides
+        ]
         payload = {
             "wallet": wallet.name,
             "address": wallet.address,
-            "fetched_count": fetch_result.fetched_total,
-            "inserted_count": fetch_result.inserted_total,
-            "duplicate_count": fetch_result.duplicate_total,
-            "pages": [page.__dict__ for page in fetch_result.pages],
+            "fetched_count": sum(result.fetched_total for result in fetch_results),
+            "inserted_count": sum(result.inserted_total for result in fetch_results),
+            "duplicate_count": sum(result.duplicate_total for result in fetch_results),
+            "side": args.side,
+            "pages": [
+                {"side": side or "unspecified", **page.__dict__}
+                for side, result in zip(sides, fetch_results)
+                for page in result.pages
+            ],
         }
         if args.json:
-            payload["trades"] = [trade.raw for trade in fetch_result.trades]
+            payload["trades"] = [trade.raw for result in fetch_results for trade in result.trades]
         print(json.dumps(payload, indent=2, sort_keys=True))
     finally:
         client.close()
@@ -587,6 +599,7 @@ def build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("--max-pages", type=int, default=None)
     fetch.add_argument("--limit-total", type=int, default=None)
     fetch.add_argument("--min-cash", type=float, default=None)
+    fetch.add_argument("--side", default="all", choices=["all", "buy", "sell", "unspecified"])
     fetch.add_argument("--json", action="store_true", help="Include raw Data API trade payloads in output")
     fetch.set_defaults(func=cmd_wallet_flow_fetch)
     replay = wallet_sub.add_parser("replay")

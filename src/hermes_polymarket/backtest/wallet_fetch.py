@@ -44,6 +44,7 @@ def fetch_wallet_trades_paginated(
     max_pages: int = 10,
     limit_total: int = 1000,
     min_cash: float | None = None,
+    side: str | None = None,
 ) -> list[WalletTrade]:
     out: list[WalletTrade] = []
     offset = 0
@@ -52,7 +53,7 @@ def fetch_wallet_trades_paginated(
         if remaining <= 0:
             break
         limit = min(page_size, remaining)
-        batch = client.get_trades_for_wallet(wallet, limit=limit, offset=offset, min_cash=min_cash)
+        batch = client.get_trades_for_wallet(wallet, limit=limit, offset=offset, min_cash=min_cash, side=side)
         if not batch:
             break
         out.extend(batch)
@@ -71,6 +72,7 @@ def fetch_and_persist_wallet_trades_paginated(
     max_pages: int = 10,
     limit_total: int = 1000,
     min_cash: float | None = None,
+    side: str | None = None,
 ) -> FetchRunResult:
     out: list[WalletTrade] = []
     pages: list[FetchPageResult] = []
@@ -80,7 +82,7 @@ def fetch_and_persist_wallet_trades_paginated(
         if remaining <= 0:
             break
         limit = min(page_size, remaining)
-        batch = client.get_trades_for_wallet(wallet, limit=limit, offset=offset, min_cash=min_cash)
+        batch = client.get_trades_for_wallet(wallet, limit=limit, offset=offset, min_cash=min_cash, side=side)
         if not batch:
             break
         counts = insert_wallet_trades(db, batch)

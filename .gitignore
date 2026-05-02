@@ -9,6 +9,7 @@ data/
 logs/
 external_repos/
 artifacts/
+plan.md
 
 # Beads / Dolt files (added by bd init)
 .dolt/

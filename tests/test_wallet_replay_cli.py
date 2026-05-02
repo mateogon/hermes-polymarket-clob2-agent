@@ -98,7 +98,7 @@ def test_wallet_fetch_persists_and_dedupes(monkeypatch, tmp_path, capsys):
             pass
 
     monkeypatch.setattr("hermes_polymarket.data_sources.polymarket_data_api.PolymarketDataApi", FakeDataApi)
-    assert cli.main(["wallet-flow", "fetch", "--wallet", "coinman2", "--page-size", "2", "--max-pages", "1", "--limit-total", "2"]) == 0
+    assert cli.main(["wallet-flow", "fetch", "--wallet", "coinman2", "--page-size", "2", "--max-pages", "1", "--limit-total", "2", "--side", "buy"]) == 0
     output = capsys.readouterr().out
     assert '"inserted_count": 1' in output
     assert '"duplicate_count": 1' in output
