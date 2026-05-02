@@ -51,7 +51,9 @@ def test_wallet_flow_metrics_aggregate_copyable_and_rejected(tmp_path):
     assert metrics.copyable_trades == 1
     assert metrics.rejected_trades == 1
     assert metrics.rejected_by_reason["stale_wallet_trade"] == 1
-    assert metrics.paper_pnl == 1.0
+    assert metrics.paper_pnl_status == "not_computed_no_exit_model"
+    assert metrics.paper_pnl_experimental is None
+    assert metrics.to_dict()["entry_copyability_metrics"]["copyable_trades"] == 1
     assert metrics.best_category == "crypto"
     db.close()
 

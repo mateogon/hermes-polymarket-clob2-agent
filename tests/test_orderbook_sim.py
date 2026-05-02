@@ -1,4 +1,5 @@
 import pytest
+from datetime import timezone
 
 from hermes_polymarket.polymarket.orderbook import parse_orderbook, simulate_buy_fill, simulate_sell_fill
 
@@ -51,3 +52,16 @@ def test_sell_walks_bid_side():
     assert fill.levels_filled == 2
     assert fill.avg_price < 0.48
 
+
+def test_parse_orderbook_timestamp_numeric_ms_seconds_and_iso():
+    ms = parse_orderbook("t", {"timestamp": "1757908892351", "bids": [], "asks": []})
+    assert ms.timestamp.year == 2025
+    assert ms.timestamp.tzinfo == timezone.utc
+
+    sec = parse_orderbook("t", {"timestamp": "1234567890", "bids": [], "asks": []})
+    assert sec.timestamp.year == 2009
+    assert sec.timestamp.tzinfo == timezone.utc
+
+    iso = parse_orderbook("t", {"timestamp": "2026-01-02T03:04:05Z", "bids": [], "asks": []})
+    assert iso.timestamp.year == 2026
+    assert iso.timestamp.tzinfo is not None

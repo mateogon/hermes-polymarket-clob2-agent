@@ -23,6 +23,44 @@ def test_polymarket_market_ws_normalizes_supported_events():
     assert events[0].latency_ms == 100
 
 
+def test_polymarket_market_ws_ignores_pong():
+    assert normalize_market_ws_payload("PONG", received_ts_ms=1000) == []
+
+
+def test_polymarket_price_change_is_exploded_by_asset_id_and_removed_flag():
+    events = normalize_market_ws_payload(
+        {
+            "event_type": "price_change",
+            "market": "0xabc",
+            "timestamp": "1757908892351",
+            "price_changes": [
+                {"asset_id": "asset-1", "price": "0.5", "size": "200", "side": "BUY"},
+                {"asset_id": "asset-2", "price": "0.5", "size": "0", "side": "SELL"},
+            ],
+        },
+        received_ts_ms=1757908892400,
+    )
+    assert [event.key for event in events] == ["asset-1", "asset-2"]
+    assert all(event.event_type == EventType.POLY_PRICE_CHANGE for event in events)
+    assert events[0].payload["market"] == "0xabc"
+    assert events[0].payload["removed"] is False
+    assert events[1].payload["removed"] is True
+
+
+def test_polymarket_market_ws_normalizes_tick_size_change_and_new_market():
+    events = normalize_market_ws_payload(
+        [
+            {"event_type": "tick_size_change", "asset_id": "asset-1", "market": "0xabc", "new_tick_size": "0.001"},
+            {"event_type": "new_market", "condition_id": "0xdef", "clob_token_ids": ["1", "2"]},
+        ],
+        received_ts_ms=1000,
+    )
+    assert events[0].event_type == EventType.POLY_TICK_SIZE_CHANGE
+    assert events[0].key == "asset-1"
+    assert events[1].event_type == EventType.POLY_NEW_MARKET
+    assert events[1].key == "0xdef"
+
+
 def test_binance_normalizes_trade_book_and_kline():
     assert "btcusdt@aggTrade" in binance_combined_stream_url(["BTCUSDT"])
 

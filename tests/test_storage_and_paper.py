@@ -41,3 +41,16 @@ def test_database_persists_normalized_data_events(tmp_path):
     assert rows[0]["latency_ms"] == 250
     assert "best_bid" in rows[0]["payload_json"]
     db.close()
+
+
+def test_database_upserts_source_health(tmp_path):
+    db = Database(tmp_path / "paper.sqlite3")
+    db.init_schema(1000)
+    db.upsert_source_health(DataEvent("poly", EventType.POLY_BOOK, 1000, 1100, "asset", {}), dropped_events=2)
+    db.upsert_source_health(DataEvent("poly", EventType.SOURCE_HEALTH, None, 1200, "poly", {"ok": False}), dropped_events=1)
+    row = db.source_health("poly")[0]
+    assert row["messages_seen"] == 2
+    assert row["errors_seen"] == 1
+    assert row["dropped_events"] == 3
+    assert row["status"] == "error"
+    db.close()

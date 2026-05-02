@@ -14,6 +14,8 @@ class EventType(str, Enum):
     POLY_BEST_BID_ASK = "poly_best_bid_ask"
     POLY_LAST_TRADE = "poly_last_trade"
     POLY_MARKET_RESOLVED = "poly_market_resolved"
+    POLY_TICK_SIZE_CHANGE = "poly_tick_size_change"
+    POLY_NEW_MARKET = "poly_new_market"
     RTDS_CRYPTO_PRICE = "rtds_crypto_price"
     BINANCE_TRADE = "binance_trade"
     BINANCE_BOOK_TICKER = "binance_book_ticker"
@@ -48,4 +50,3 @@ class DataEvent:
 
 def now_ms() -> int:
     return int(time() * 1000)
-

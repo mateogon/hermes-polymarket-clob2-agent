@@ -71,6 +71,8 @@ The data-source layer normalizes public events into `DataEvent` records before t
 
 Signals remain signal-only. Wallet flow can produce paper-copy candidates, but it cannot place live orders.
 
+Wallet-flow reporting is entry-copyability only until an exit model exists. The report intentionally marks PnL as `not_computed_no_exit_model`; paper PnL should only be interpreted after a leader-exit, TP/SL/timeout, or resolution-payout model is implemented.
+
 ## Reference Repos Cloned
 
 - `external_repos/chainstacklabs-polyclaw`

@@ -18,19 +18,29 @@ WALLET_FLOW_EVENT = "wallet_flow"
 
 @dataclass(frozen=True)
 class WalletFlowMetrics:
+    paper_pnl_status: str = "not_computed_no_exit_model"
     observed_trades: int = 0
     copyable_trades: int = 0
     rejected_trades: int = 0
     average_detection_delay: float = 0.0
     average_worse_entry_cents: float = 0.0
-    paper_pnl: float = 0.0
-    max_drawdown: float = 0.0
+    paper_pnl_experimental: float | None = None
+    max_drawdown_experimental: float | None = None
     best_category: str | None = None
     worst_category: str | None = None
     rejected_by_reason: dict[str, int] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["entry_copyability_metrics"] = {
+            "observed_trades": self.observed_trades,
+            "copyable_trades": self.copyable_trades,
+            "rejected_trades": self.rejected_trades,
+            "average_detection_delay": self.average_detection_delay,
+            "average_worse_entry_cents": self.average_worse_entry_cents,
+            "rejected_by_reason": self.rejected_by_reason or {},
+        }
+        return data
 
 
 def wallet_flow_event(
@@ -94,7 +104,8 @@ def wallet_flow_metrics(db: Database, *, wallet: str | None = None) -> WalletFlo
     rejected = [p for p in payloads if not p.get("copyable")]
     delays = [float(p["latency_seconds"]) for p in payloads if p.get("latency_seconds") is not None]
     worse = [float(p["worse_by_cents"]) for p in copyable if p.get("worse_by_cents") is not None]
-    pnl_series = [float(p.get("paper_pnl") or 0.0) for p in payloads]
+    pnl_values = [float(p.get("paper_pnl") or 0.0) for p in payloads if p.get("paper_pnl") is not None]
+    has_exit_model = any(str(p.get("pnl_status") or "") == "computed_with_exit_model" for p in payloads)
     category_pnl: dict[str, float] = {}
     rejected_by_reason: dict[str, int] = {}
 
@@ -109,13 +120,14 @@ def wallet_flow_metrics(db: Database, *, wallet: str | None = None) -> WalletFlo
     worst_category = min(category_pnl, key=category_pnl.get) if category_pnl else None
 
     return WalletFlowMetrics(
+        paper_pnl_status="computed_with_exit_model" if has_exit_model else "not_computed_no_exit_model",
         observed_trades=observed,
         copyable_trades=len(copyable),
         rejected_trades=len(rejected),
         average_detection_delay=sum(delays) / len(delays) if delays else 0.0,
         average_worse_entry_cents=sum(worse) / len(worse) if worse else 0.0,
-        paper_pnl=sum(pnl_series),
-        max_drawdown=_max_drawdown(pnl_series),
+        paper_pnl_experimental=sum(pnl_values) if has_exit_model else None,
+        max_drawdown_experimental=_max_drawdown(pnl_values) if has_exit_model else None,
         best_category=best_category,
         worst_category=worst_category,
         rejected_by_reason=rejected_by_reason,
@@ -155,4 +167,3 @@ def _max_drawdown(pnl_series: list[float]) -> float:
         peak = max(peak, equity)
         max_dd = min(max_dd, equity - peak)
     return abs(max_dd)
-

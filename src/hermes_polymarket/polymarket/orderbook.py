@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from hermes_polymarket.polymarket.types import Fill, FillResult, OrderBook, OrderBookLevel
@@ -25,14 +25,26 @@ def _levels(values: Iterable[dict[str, Any]]) -> tuple[OrderBookLevel, ...]:
 def parse_orderbook(token_id: str, data: dict[str, Any]) -> OrderBook:
     bids = _levels(data.get("bids", []))
     asks = _levels(data.get("asks", []))
-    timestamp = None
-    raw_ts = data.get("timestamp")
-    if isinstance(raw_ts, str):
-        try:
-            timestamp = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
-        except ValueError:
-            timestamp = None
+    timestamp = parse_timestamp(data.get("timestamp"))
     return OrderBook(token_id=token_id, bids=bids, asks=asks, timestamp=timestamp, raw=data)
+
+
+def parse_timestamp(raw: Any) -> datetime | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        if isinstance(raw, (int, float)) or text.isdigit():
+            value = int(float(text))
+            if value > 10_000_000_000:
+                return datetime.fromtimestamp(value / 1000.0, tz=timezone.utc)
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
 
 
 def empty_fill(status: str) -> FillResult:
@@ -168,4 +180,3 @@ def simulate_sell_fill(
         status="partial_fill" if is_partial else "filled",
         fills=tuple(fills),
     )
-

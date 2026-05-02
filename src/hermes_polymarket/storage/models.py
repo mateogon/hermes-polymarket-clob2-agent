@@ -65,4 +65,15 @@ ON data_events(source, event_type, received_ts_ms);
 
 CREATE INDEX IF NOT EXISTS idx_data_events_key
 ON data_events(event_key, received_ts_ms);
+
+CREATE TABLE IF NOT EXISTS source_health (
+  source TEXT PRIMARY KEY,
+  last_seen_ts_ms INTEGER NOT NULL,
+  last_latency_ms INTEGER,
+  messages_seen INTEGER NOT NULL DEFAULT 0,
+  errors_seen INTEGER NOT NULL DEFAULT 0,
+  dropped_events INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'unknown',
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """

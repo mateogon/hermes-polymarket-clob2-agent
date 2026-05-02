@@ -22,6 +22,8 @@ EVENT_MAP = {
     "best_bid_ask": EventType.POLY_BEST_BID_ASK,
     "last_trade_price": EventType.POLY_LAST_TRADE,
     "market_resolved": EventType.POLY_MARKET_RESOLVED,
+    "tick_size_change": EventType.POLY_TICK_SIZE_CHANGE,
+    "new_market": EventType.POLY_NEW_MARKET,
 }
 
 
@@ -41,6 +43,8 @@ def _event_ts(payload: dict[str, Any]) -> int | None:
 
 
 def normalize_market_ws_payload(payload: Any, received_ts_ms: int | None = None) -> list[DataEvent]:
+    if payload == "PONG":
+        return []
     messages = payload if isinstance(payload, list) else [payload]
     events: list[DataEvent] = []
     for message in messages:
@@ -48,6 +52,27 @@ def normalize_market_ws_payload(payload: Any, received_ts_ms: int | None = None)
             continue
         event_type = EVENT_MAP.get(str(message.get("event_type") or ""))
         if event_type is None:
+            continue
+        if event_type == EventType.POLY_PRICE_CHANGE and isinstance(message.get("price_changes"), list):
+            market = message.get("market")
+            event_ts_ms = _event_ts(message)
+            for change in message["price_changes"]:
+                if not isinstance(change, dict):
+                    continue
+                payload_for_asset = dict(change)
+                payload_for_asset["market"] = market
+                payload_for_asset["event_type"] = "price_change"
+                payload_for_asset["removed"] = str(change.get("size")) == "0"
+                events.append(
+                    DataEvent(
+                        source="polymarket_market_ws",
+                        event_type=event_type,
+                        event_ts_ms=event_ts_ms,
+                        received_ts_ms=received_ts_ms or now_ms(),
+                        key=str(change.get("asset_id") or "unknown"),
+                        payload=payload_for_asset,
+                    )
+                )
             continue
         key = str(message.get("asset_id") or message.get("market") or message.get("condition_id") or "unknown")
         events.append(
@@ -71,11 +96,17 @@ async def run_polymarket_market_ws(
     subscription = market_subscription(asset_ids)
     while True:
         try:
-            async with websockets.connect(POLY_MARKET_WS, ping_interval=10, ping_timeout=10) as ws:
+            async with websockets.connect(POLY_MARKET_WS, ping_interval=None) as ws:
                 await ws.send(json.dumps(subscription))
-                async for raw in ws:
-                    for event in normalize_market_ws_payload(json.loads(raw)):
-                        await bus.publish(event)
+                keepalive = asyncio.create_task(_keepalive(ws))
+                try:
+                    async for raw in ws:
+                        if raw == "PONG":
+                            continue
+                        for event in normalize_market_ws_payload(json.loads(raw)):
+                            await bus.publish(event)
+                finally:
+                    keepalive.cancel()
         except Exception as exc:
             await bus.publish(
                 DataEvent(
@@ -89,3 +120,8 @@ async def run_polymarket_market_ws(
             )
             await asyncio.sleep(reconnect_delay)
 
+
+async def _keepalive(ws: Any) -> None:
+    while True:
+        await asyncio.sleep(10)
+        await ws.send("PING")

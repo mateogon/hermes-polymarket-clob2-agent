@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_polymarket.data_sources.base import DataEvent
+from hermes_polymarket.data_sources.base import EventType
 from hermes_polymarket.storage.models import SCHEMA
 
 
@@ -123,3 +124,37 @@ class Database:
         query += " ORDER BY received_ts_ms DESC, id DESC LIMIT ?"
         values.append(limit)
         return list(self.conn.execute(query, values))
+
+    def upsert_source_health(self, event: DataEvent, *, dropped_events: int = 0) -> None:
+        is_error = event.event_type == EventType.SOURCE_HEALTH and event.payload.get("ok") is False
+        existing = self.conn.execute("SELECT * FROM source_health WHERE source = ?", (event.source,)).fetchone()
+        if existing is None:
+            self.conn.execute(
+                """
+                INSERT INTO source_health
+                  (source, last_seen_ts_ms, last_latency_ms, messages_seen, errors_seen, dropped_events, status)
+                VALUES (?, ?, ?, 1, ?, ?, ?)
+                """,
+                (event.source, event.received_ts_ms, event.latency_ms, 1 if is_error else 0, dropped_events, "error" if is_error else "ok"),
+            )
+        else:
+            self.conn.execute(
+                """
+                UPDATE source_health
+                SET last_seen_ts_ms = ?,
+                    last_latency_ms = ?,
+                    messages_seen = messages_seen + 1,
+                    errors_seen = errors_seen + ?,
+                    dropped_events = dropped_events + ?,
+                    status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE source = ?
+                """,
+                (event.received_ts_ms, event.latency_ms, 1 if is_error else 0, dropped_events, "error" if is_error else "ok", event.source),
+            )
+        self.conn.commit()
+
+    def source_health(self, source: str | None = None) -> list[sqlite3.Row]:
+        if source:
+            return list(self.conn.execute("SELECT * FROM source_health WHERE source = ?", (source,)))
+        return list(self.conn.execute("SELECT * FROM source_health ORDER BY source"))
