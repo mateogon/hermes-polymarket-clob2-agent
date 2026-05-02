@@ -1619,6 +1619,22 @@ def cmd_strategy_arena_artifacts(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_evidence_dashboard(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.evidence_dashboard import (
+        evidence_dashboard,
+        expand_db_globs,
+        write_evidence_dashboard,
+    )
+
+    db_paths = expand_db_globs(args.db_glob)
+    result = evidence_dashboard(db_paths, include_fixture=args.include_fixture)
+    if args.output:
+        output = write_evidence_dashboard(result, args.output)
+        result = {**result, "artifact": str(output)}
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_l2_recorder_start(args: argparse.Namespace) -> int:
     from hermes_polymarket.crypto.l2_recorder import run_l2_recorder
     from hermes_polymarket.data_sources.base import DataEvent, EventType, now_ms
@@ -2131,6 +2147,12 @@ def build_parser() -> argparse.ArgumentParser:
     strategy_arena_artifacts = strategy_arena_sub.add_parser("artifacts")
     strategy_arena_artifacts.add_argument("--file", default=None)
     strategy_arena_artifacts.set_defaults(func=cmd_strategy_arena_artifacts)
+
+    evidence_dashboard_parser = sub.add_parser("evidence-dashboard")
+    evidence_dashboard_parser.add_argument("--db-glob", action="append", required=True)
+    evidence_dashboard_parser.add_argument("--output", default="artifacts/evidence/latest.json")
+    evidence_dashboard_parser.add_argument("--include-fixture", action="store_true")
+    evidence_dashboard_parser.set_defaults(func=cmd_evidence_dashboard)
 
     l2 = sub.add_parser("l2-recorder")
     l2_sub = l2.add_subparsers(dest="l2_command", required=True)
