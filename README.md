@@ -93,12 +93,13 @@ Crypto latency measurement commands are measurement/paper-only:
 
 ```bash
 .venv/bin/python -m hermes_polymarket.cli crypto-latency discover
+.venv/bin/python -m hermes_polymarket.cli crypto-latency record --seconds 5 --fixture
 .venv/bin/python -m hermes_polymarket.cli crypto-latency record --seconds 300
 .venv/bin/python -m hermes_polymarket.cli crypto-latency report
 .venv/bin/python -m hermes_polymarket.cli crypto-latency opportunities
 ```
 
-The first version stores consensus ticks, latency events, market windows, and paper opportunities. `record` is intentionally a safe skeleton until local L2 recorder orchestration is added.
+The recorder stores public normalized data events, source health, consensus ticks, and external-move latency events. `--fixture` runs a deterministic local observation; without it, `record` starts public Binance, Coinbase, Kraken, and Polymarket RTDS streams for a bounded measurement window. It still does not place, sign, or prepare live orders.
 
 Live gate check, expected to refuse by default:
 

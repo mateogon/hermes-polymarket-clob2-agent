@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -705,16 +707,92 @@ def cmd_crypto_latency_discover(_: argparse.Namespace) -> int:
 
 
 def cmd_crypto_latency_record(args: argparse.Namespace) -> int:
+    from hermes_polymarket.crypto.latency_recorder import RecorderConfig, run_crypto_latency_recorder
+    from hermes_polymarket.data_sources.base import DataEvent, EventType, now_ms
+    from hermes_polymarket.data_sources.event_bus import EventBus
     from hermes_polymarket.storage.crypto_latency import crypto_latency_report
 
     settings = _settings()
     db = Database(settings.database_path)
     db.init_schema(settings.initial_bankroll)
     try:
-        payload = crypto_latency_report(db)
-        payload["status"] = "record_skeleton"
-        payload["seconds"] = args.seconds
-        payload["message"] = "Safe skeleton only: wire live public WS orchestration in a later local-L2 recorder step."
+        symbols = tuple(symbol.strip().lower() for symbol in args.symbols.split(",") if symbol.strip())
+        if not symbols:
+            print("crypto-latency record requires at least one symbol")
+            return 2
+        seconds = max(1, min(args.seconds, 900))
+
+        async def publish_fixture_crypto_events(bus: EventBus) -> None:
+            ts = now_ms()
+            for price in (100.0, 100.02, 101.0):
+                await bus.publish(
+                    DataEvent(
+                        source="fixture_binance",
+                        event_type=EventType.BINANCE_TRADE,
+                        event_ts_ms=ts,
+                        received_ts_ms=ts,
+                        key="btcusdt",
+                        payload={"symbol": "BTCUSDT", "price": price, "qty": 1.0},
+                    )
+                )
+                await bus.publish(
+                    DataEvent(
+                        source="fixture_coinbase",
+                        event_type=EventType.COINBASE_TICKER,
+                        event_ts_ms=None,
+                        received_ts_ms=ts,
+                        key="btc-usd",
+                        payload={"product_id": "BTC-USD", "price": price},
+                    )
+                )
+                ts += 1000
+
+        async def run_recording() -> dict[str, Any]:
+            bus = EventBus()
+            tasks: list[asyncio.Task[None]] = []
+            if args.fixture:
+                await publish_fixture_crypto_events(bus)
+            else:
+                from hermes_polymarket.data_sources.binance_stream import run_binance_stream
+                from hermes_polymarket.data_sources.coinbase_stream import run_coinbase_ticker
+                from hermes_polymarket.data_sources.kraken_stream import run_kraken_ticker
+                from hermes_polymarket.data_sources.polymarket_rtds import run_polymarket_rtds_crypto
+
+                coinbase_products = tuple(symbol.replace("usdt", "-USD").upper() for symbol in symbols)
+                kraken_symbols = tuple(symbol.replace("usdt", "/USD").upper() for symbol in symbols)
+                tasks = [
+                    asyncio.create_task(run_binance_stream(bus, symbols=symbols)),
+                    asyncio.create_task(run_coinbase_ticker(bus, product_ids=coinbase_products)),
+                    asyncio.create_task(run_kraken_ticker(bus, symbols=kraken_symbols)),
+                    asyncio.create_task(run_polymarket_rtds_crypto(bus, symbols=symbols)),
+                ]
+            try:
+                summary = await run_crypto_latency_recorder(
+                    db=db,
+                    bus=bus,
+                    config=RecorderConfig(
+                        symbols=symbols,
+                        seconds=seconds,
+                        min_move_pct=args.min_move_pct,
+                        cooldown_ms=args.cooldown_ms,
+                    ),
+                )
+            finally:
+                for task in tasks:
+                    task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.gather(*tasks)
+
+            return {
+                "mode": "measurement_paper_only",
+                "data_quality": "paper_live" if not args.fixture else "local_observation",
+                "fixture": args.fixture,
+                "symbols": symbols,
+                "summary": summary.to_dict(),
+                "report": crypto_latency_report(db),
+            }
+
+        payload = asyncio.run(run_recording())
         print(json.dumps(payload, indent=2, sort_keys=True))
     finally:
         db.close()
@@ -861,6 +939,10 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_discover.set_defaults(func=cmd_crypto_latency_discover)
     crypto_record = crypto_sub.add_parser("record")
     crypto_record.add_argument("--seconds", type=int, default=300)
+    crypto_record.add_argument("--symbols", default="btcusdt,ethusdt,solusdt,xrpusdt")
+    crypto_record.add_argument("--fixture", action="store_true", help="Publish deterministic local crypto events into the recorder")
+    crypto_record.add_argument("--min-move-pct", type=float, default=0.08)
+    crypto_record.add_argument("--cooldown-ms", type=int, default=5000)
     crypto_record.set_defaults(func=cmd_crypto_latency_record)
     crypto_report = crypto_sub.add_parser("report")
     crypto_report.set_defaults(func=cmd_crypto_latency_report)

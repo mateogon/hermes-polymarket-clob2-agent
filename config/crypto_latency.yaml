@@ -21,6 +21,7 @@ polymarket:
   max_seconds_to_expiry: 900
 
 paper_opportunity:
+  enabled: true
   amount_usd: 5.0
   model_probability_floor: 0.52
   model_probability_cap: 0.75
@@ -35,3 +36,20 @@ paper_opportunity:
 recording:
   default_seconds: 300
   artifact_dir: artifacts/crypto_latency
+
+runtime:
+  poll_interval_ms: 250
+  max_record_seconds: 900
+  min_record_seconds: 10
+  event_cooldown_ms: 5000
+  max_events_per_recording: 500
+  require_polymarket_bbo: true
+
+market_discovery:
+  query_terms:
+    - bitcoin up down
+    - ethereum up down
+    - solana up down
+    - xrp up down
+  max_markets: 20
+  refresh_seconds: 60
