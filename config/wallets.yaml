@@ -1,0 +1,11 @@
+wallets:
+  - name: coinman2
+    address: "0x55be7aa03ecfbe37aa5460db791205f7ac9ddca3"
+    mode: "signal_only"
+    min_trade_size_usd: 100
+    max_copy_delay_seconds: 20
+    max_entry_worse_cents: 2
+    categories:
+      - crypto
+      - short_duration
+

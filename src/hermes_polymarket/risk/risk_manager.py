@@ -31,18 +31,19 @@ class RiskManager:
         fill: FillResult,
         exposure: ExposureSnapshot,
     ) -> RiskDecision:
-        if proposal.amount_usd <= 0:
+        exposure_amount = proposal.amount_usd if proposal.side.lower() == "buy" else fill.total_cost
+        if exposure_amount <= 0:
             return self._reject("invalid_amount", "Order amount must be positive")
-        if proposal.amount_usd > self.settings.max_order_usd:
-            return self._reject("max_order_usd", f"Order ${proposal.amount_usd:.2f} exceeds cap ${self.settings.max_order_usd:.2f}")
+        if exposure_amount > self.settings.max_order_usd:
+            return self._reject("max_order_usd", f"Order ${exposure_amount:.2f} exceeds cap ${self.settings.max_order_usd:.2f}")
         if exposure.daily_pnl <= -self.settings.daily_loss_limit_usd:
             return self._reject("daily_loss_limit", "Daily loss limit reached")
         if exposure.open_positions >= self.settings.max_open_positions:
             return self._reject("max_open_positions", "Maximum open positions reached")
-        if exposure.market_exposure_usd + proposal.amount_usd > self.settings.max_market_exposure_usd:
+        if exposure.market_exposure_usd + exposure_amount > self.settings.max_market_exposure_usd:
             return self._reject("max_market_exposure", "Per-market exposure cap reached")
         max_portfolio = exposure.bankroll * self.settings.max_portfolio_exposure_pct
-        if exposure.portfolio_exposure_usd + proposal.amount_usd > max_portfolio:
+        if exposure.portfolio_exposure_usd + exposure_amount > max_portfolio:
             return self._reject("max_portfolio_exposure", "Portfolio exposure cap reached")
         if proposal.expiry is not None:
             hours = (proposal.expiry - datetime.now(timezone.utc)).total_seconds() / 3600.0
@@ -59,9 +60,7 @@ class RiskManager:
             return self._reject("near_certain_price", "Entry price above configured ceiling")
         if abs(fill.slippage) > self.settings.max_slippage:
             return self._reject("max_slippage", "Slippage exceeds configured maximum")
-        depth_usd = sum(level.price * level.size for level in book.asks)
-        if proposal.side.lower() == "sell":
-            depth_usd = sum(level.price * level.size for level in book.bids)
+        depth_usd = executable_depth_usd(book, proposal.side, self.settings.max_slippage)
         if depth_usd < self.settings.min_orderbook_depth_usd:
             return self._reject("min_liquidity", "Orderbook depth below configured minimum")
 
@@ -78,7 +77,7 @@ class RiskManager:
         if kelly.edge > self.settings.reject_edge_over:
             return RiskDecision(False, "absurd_edge", "Adjusted edge is too large without manual approval", kelly, 0.0)
 
-        capped = min(kelly.size_usd, self.settings.max_order_usd, proposal.amount_usd)
+        capped = min(kelly.size_usd, self.settings.max_order_usd, exposure_amount)
         if capped <= 0:
             return RiskDecision(False, "kelly_zero", "Kelly sizing produced no position", kelly, 0.0)
         return RiskDecision(True, "allowed", "Order passed risk checks", kelly, capped)
@@ -87,3 +86,17 @@ class RiskManager:
     def _reject(reason: str, explanation: str) -> RiskDecision:
         return RiskDecision(False, reason, explanation)
 
+
+def executable_depth_usd(book: OrderBook, side: str, max_slippage: float) -> float:
+    """Return notional depth close enough to the current midpoint to execute."""
+    midpoint = book.midpoint
+    if side.lower() == "sell":
+        if not book.bids:
+            return 0.0
+        floor = (midpoint or book.best_bid or 0.0) * (1.0 - max_slippage)
+        return sum(level.price * level.size for level in book.bids if level.price >= floor)
+
+    if not book.asks:
+        return 0.0
+    ceiling = (midpoint or book.best_ask or 1.0) * (1.0 + max_slippage)
+    return sum(level.price * level.size for level in book.asks if level.price <= ceiling)

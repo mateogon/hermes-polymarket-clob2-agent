@@ -27,3 +27,10 @@ def test_no_v1_order_fields_in_src():
     assert "taker=" not in text
     assert '"taker"' not in text
     assert "'taker'" not in text
+
+
+def test_dry_run_script_has_no_private_or_posting_path():
+    text = (ROOT / "scripts" / "dry_run_order.py").read_text()
+    assert "private_client_state" not in text
+    assert "create_and_post" not in text
+    assert "post_order" not in text

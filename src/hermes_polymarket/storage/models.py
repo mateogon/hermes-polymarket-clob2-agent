@@ -47,5 +47,22 @@ CREATE TABLE IF NOT EXISTS journal (
   payload_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-"""
 
+CREATE TABLE IF NOT EXISTS data_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  event_ts_ms INTEGER,
+  received_ts_ms INTEGER NOT NULL,
+  latency_ms INTEGER,
+  event_key TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_data_events_source_type
+ON data_events(source, event_type, received_ts_ms);
+
+CREATE INDEX IF NOT EXISTS idx_data_events_key
+ON data_events(event_key, received_ts_ms);
+"""

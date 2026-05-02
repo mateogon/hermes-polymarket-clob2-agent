@@ -16,14 +16,23 @@ class GammaClient:
     def close(self) -> None:
         self._http.close()
 
-    def search_markets(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
-        response = self._http.get(f"{GAMMA_BASE}/markets", params={"_q": query, "limit": limit, "active": "true", "closed": "false"})
+    def list_markets(self, **params: Any) -> list[dict[str, Any]]:
+        response = self._http.get(f"{GAMMA_BASE}/markets", params=params)
         response.raise_for_status()
         data = response.json()
         return data if isinstance(data, list) else []
 
+    def search_markets(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+        return self.list_markets(_q=query, limit=limit, active="true", closed="false")
+
     def active_markets(self, limit: int = 50) -> list[dict[str, Any]]:
-        response = self._http.get(f"{GAMMA_BASE}/markets", params={"limit": limit, "active": "true", "closed": "false"})
-        response.raise_for_status()
-        data = response.json()
-        return data if isinstance(data, list) else []
+        return self.list_markets(limit=limit, active="true", closed="false")
+
+    def markets_by_slug(self, slug: str) -> list[dict[str, Any]]:
+        return self.list_markets(slug=slug, limit=10)
+
+    def markets_by_condition_id(self, condition_id: str) -> list[dict[str, Any]]:
+        return self.list_markets(condition_ids=condition_id, limit=10)
+
+    def markets_by_token_id(self, token_id: str) -> list[dict[str, Any]]:
+        return self.list_markets(clob_token_ids=token_id, limit=10)

@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from hermes_polymarket.data_sources.base import DataEvent
 from hermes_polymarket.storage.models import SCHEMA
 
 
@@ -87,3 +88,38 @@ class Database:
     def trades(self) -> list[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM trades ORDER BY id"))
 
+    def insert_data_event(self, event: DataEvent) -> int:
+        cur = self.conn.execute(
+            """
+            INSERT INTO data_events
+              (source, event_type, event_ts_ms, received_ts_ms, latency_ms, event_key, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.source,
+                event.event_type.value,
+                event.event_ts_ms,
+                event.received_ts_ms,
+                event.latency_ms,
+                event.key,
+                json.dumps(event.payload, sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def data_events(self, *, source: str | None = None, event_type: str | None = None, limit: int = 100) -> list[sqlite3.Row]:
+        query = "SELECT * FROM data_events"
+        where = []
+        values: list[Any] = []
+        if source:
+            where.append("source = ?")
+            values.append(source)
+        if event_type:
+            where.append("event_type = ?")
+            values.append(event_type)
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY received_ts_ms DESC, id DESC LIMIT ?"
+        values.append(limit)
+        return list(self.conn.execute(query, values))

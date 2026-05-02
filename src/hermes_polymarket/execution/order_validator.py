@@ -26,10 +26,19 @@ class OrderValidator:
         if proposal.token_id not in {t.token_id for t in metadata.tokens}:
             decision = RiskDecision(False, "token_not_in_market", "Token ID is not part of CLOB market metadata")
             return ValidationResult(decision, "token_not_in_market", 0.0, 0.0)
-        if proposal.amount_usd < metadata.min_order_size:
+        if proposal.side.lower() == "buy" and proposal.amount_usd < metadata.min_order_size:
             decision = RiskDecision(False, "min_order_size", "Amount is below CLOB minimum order size")
             return ValidationResult(decision, "min_order_size", 0.0, 0.0)
-        fill = simulate_buy_fill(book, proposal.amount_usd, order_type="fok") if proposal.side.lower() == "buy" else simulate_sell_fill(book, proposal.amount_usd, order_type="fok")
+        if proposal.side.lower() == "buy":
+            fill = simulate_buy_fill(book, proposal.amount_usd, order_type="fok")
+        else:
+            sell_shares = proposal.sell_shares
+            if sell_shares is None or sell_shares <= 0:
+                decision = RiskDecision(False, "invalid_sell_shares", "Sell orders must provide positive share quantity")
+                return ValidationResult(decision, "invalid_sell_shares", 0.0, 0.0)
+            fill = simulate_sell_fill(book, sell_shares, order_type="fok")
+            if fill.total_cost < metadata.min_order_size:
+                decision = RiskDecision(False, "min_order_size", "Sell notional is below CLOB minimum order size")
+                return ValidationResult(decision, "min_order_size", fill.avg_price, fill.total_shares)
         decision = self.risk_manager.evaluate(proposal, book, fill, exposure)
         return ValidationResult(decision, fill.status, fill.avg_price, fill.total_shares)
-

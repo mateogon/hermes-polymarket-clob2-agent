@@ -111,5 +111,5 @@ class TradeProposal:
     model_probability: float
     confidence: float
     reason: str
+    sell_shares: float | None = None
     expiry: datetime | None = None
-
