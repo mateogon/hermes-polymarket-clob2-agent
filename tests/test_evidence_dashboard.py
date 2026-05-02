@@ -145,3 +145,26 @@ def test_evidence_dashboard_cli_writes_output(tmp_path, capsys):
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["mode"] == "forward_paper_evidence_dashboard"
     assert parsed["artifact"] == str(output)
+
+
+def test_evidence_dashboard_reports_strategy_versions(tmp_path):
+    db = _db(tmp_path, "x.sqlite3")
+    _run(db, run_id="v1", threshold=0.01)
+    insert_forward_run(
+        db,
+        run_id="v2",
+        symbols=("btcusdt",),
+        config={"min_move_pct": 0.01, "strategy_version": "stale_fair_value_v2", "use_fair_value": True},
+        summary={},
+        report={},
+        quality={},
+        artifacts={},
+    )
+    _signal(db, signal_id="s1", run_id="v1", symbol="btcusdt")
+    _signal(db, signal_id="s2", run_id="v2", symbol="btcusdt")
+    db.close()
+
+    out = evidence_dashboard([tmp_path / "x.sqlite3"])
+    assert out["strategy_versions"]["threshold_only_v1"]["signals"] == 1
+    assert out["strategy_versions"]["stale_fair_value_v2"]["signals"] == 1
+    assert out["strategy_versions"]["stale_fair_value_v2"]["status"] == "needs_forward_data"

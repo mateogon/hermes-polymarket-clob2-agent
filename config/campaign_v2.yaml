@@ -1,0 +1,41 @@
+campaign_v2:
+  enabled: true
+  mode: paper_live
+  artifact_dir: artifacts/campaign_v2
+
+market_selection:
+  min_market_score: 0.75
+  require_two_sided_bbo: true
+  reject_extreme_prices: true
+  reject_wide_spread: true
+  reject_thin_depth: true
+
+external_move:
+  min_move_pct: 0.01
+  lookback_ms: 3000
+  cooldown_ms: 5000
+
+stale_quote:
+  enabled: true
+  max_reprice_cents: 1.0
+  stale_window_ms: 1500
+  require_bbo_before: true
+  require_bbo_after: true
+  reject_if_already_repriced: true
+
+fair_value:
+  enabled: true
+  min_edge: 0.03
+  min_probability: 0.10
+  max_probability: 0.90
+  distance_scale_pct: 0.25
+  time_decay_enabled: true
+
+paper:
+  amount_usd: 5.0
+  order_type: fok
+  max_open_positions: 5
+
+comparison:
+  include_no_trade_baseline: true
+  include_threshold_v1_baseline: true

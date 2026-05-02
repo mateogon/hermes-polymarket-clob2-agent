@@ -47,6 +47,18 @@ def _threshold(run: dict[str, Any]) -> str:
     return str(value) if value is not None else "unknown"
 
 
+def _strategy_version(run: dict[str, Any] | None) -> str:
+    if not run:
+        return "unknown"
+    config = _loads(run.get("config_json"), {})
+    explicit = config.get("strategy_version")
+    if explicit:
+        return str(explicit)
+    if config.get("use_fair_value") or config.get("use_stale_quote_gate") or config.get("min_market_score"):
+        return "stale_fair_value_v2"
+    return "threshold_only_v1"
+
+
 def _add_bucket(bucket: dict[str, Any], *, signals: int = 0, positions: int = 0, closed: int = 0, pnl: float = 0.0) -> None:
     bucket["signals"] += signals
     bucket["positions"] += positions
@@ -73,6 +85,7 @@ def evidence_dashboard(db_paths: list[str | Path], *, include_fixture: bool = Fa
             run_where = "" if include_fixture else "WHERE fixture = 0"
             run_rows = [dict(row) | {"db": db_path} for row in conn.execute(f"SELECT * FROM forward_paper_runs {run_where}")]
             run_thresholds = {row["run_id"]: _threshold(row) for row in run_rows}
+            run_versions = {row["run_id"]: _strategy_version(row) for row in run_rows}
             runs.extend(run_rows)
 
             signal_where = "" if include_fixture else "WHERE fixture = 0"
@@ -80,6 +93,7 @@ def evidence_dashboard(db_paths: list[str | Path], *, include_fixture: bool = Fa
                 data = dict(row)
                 data["db"] = db_path
                 data["threshold"] = run_thresholds.get(data["run_id"], "unknown")
+                data["strategy_version"] = run_versions.get(data["run_id"], "unknown")
                 signals.append(data)
 
             position_where = "" if include_fixture else "WHERE fixture = 0"
@@ -87,6 +101,7 @@ def evidence_dashboard(db_paths: list[str | Path], *, include_fixture: bool = Fa
                 data = dict(row)
                 data["db"] = db_path
                 data["threshold"] = run_thresholds.get(data["run_id"], "unknown")
+                data["strategy_version"] = run_versions.get(data["run_id"], "unknown")
                 positions.append(data)
         finally:
             conn.close()
@@ -95,6 +110,7 @@ def evidence_dashboard(db_paths: list[str | Path], *, include_fixture: bool = Fa
     by_threshold: dict[str, dict[str, Any]] = defaultdict(lambda: {"signals": 0, "positions": 0, "closed_positions": 0, "net_pnl": 0.0, "warnings": []})
     by_symbol: dict[str, dict[str, Any]] = defaultdict(lambda: {"signals": 0, "positions": 0, "closed_positions": 0, "net_pnl": 0.0, "warnings": []})
     by_run: dict[str, dict[str, Any]] = {}
+    by_version: dict[str, dict[str, Any]] = defaultdict(lambda: {"signals": 0, "positions": 0, "closed_positions": 0, "net_pnl": 0.0, "status": "needs_forward_data"})
 
     for run in runs:
         by_run[run["run_id"]] = {"signals": 0, "positions": 0, "closed_positions": 0, "net_pnl": 0.0, "db": run["db"]}
@@ -102,6 +118,7 @@ def evidence_dashboard(db_paths: list[str | Path], *, include_fixture: bool = Fa
     for signal in signals:
         by_threshold[signal["threshold"]]["signals"] += 1
         by_symbol[str(signal.get("symbol") or "unknown")]["signals"] += 1
+        by_version[str(signal.get("strategy_version") or "unknown")]["signals"] += 1
         by_run.setdefault(signal["run_id"], {"signals": 0, "positions": 0, "closed_positions": 0, "net_pnl": 0.0, "db": signal["db"]})["signals"] += 1
 
     for position in positions:
@@ -111,7 +128,25 @@ def evidence_dashboard(db_paths: list[str | Path], *, include_fixture: bool = Fa
         closed = int(position.get("status") == "closed")
         _add_bucket(by_threshold[threshold], positions=1, closed=closed, pnl=pnl)
         _add_bucket(by_symbol[symbol], positions=1, closed=closed, pnl=pnl)
+        _add_bucket(by_version[str(position.get("strategy_version") or "unknown")], positions=1, closed=closed, pnl=pnl)
         _add_bucket(by_run.setdefault(position["run_id"], {"signals": 0, "positions": 0, "closed_positions": 0, "net_pnl": 0.0, "db": position["db"]}), positions=1, closed=closed, pnl=pnl)
+
+    if "threshold_only_v1" in by_version:
+        by_version["threshold_only_v1"]["status"] = (
+            "rejected_or_needs_redesign" if by_version["threshold_only_v1"]["net_pnl"] < 0 else "needs_review"
+        )
+    if "stale_fair_value_v2" in by_version:
+        by_version["stale_fair_value_v2"]["status"] = (
+            "needs_forward_data" if by_version["stale_fair_value_v2"]["closed_positions"] == 0 else "needs_review"
+        )
+    by_version.setdefault(
+        "threshold_only_v1",
+        {"signals": 0, "positions": 0, "closed_positions": 0, "net_pnl": 0.0, "status": "needs_forward_data"},
+    )
+    by_version.setdefault(
+        "stale_fair_value_v2",
+        {"signals": 0, "positions": 0, "closed_positions": 0, "net_pnl": 0.0, "status": "needs_forward_data"},
+    )
 
     for threshold, bucket in by_threshold.items():
         if threshold != "unknown":
@@ -162,6 +197,7 @@ def evidence_dashboard(db_paths: list[str | Path], *, include_fixture: bool = Fa
         "net_pnl": sum(float(row.get("net_pnl") or 0.0) for row in closed_positions),
         "by_threshold": dict(by_threshold),
         "by_symbol": dict(by_symbol),
+        "strategy_versions": dict(by_version),
         "dominance": dominance,
         "readiness": readiness,
         "recommendation": "Collect more data; do not live trade.",

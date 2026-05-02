@@ -18,6 +18,7 @@ from hermes_polymarket.crypto.directional_mapping import DirectionalToken, desir
 from hermes_polymarket.crypto.event_adapter import price_reading_from_event
 from hermes_polymarket.crypto.fair_value import evaluate_fair_value_edge
 from hermes_polymarket.crypto.market_quality import MarketQualityDecision, evaluate_market_quality
+from hermes_polymarket.crypto.market_score import _token_score
 from hermes_polymarket.crypto.runtime_state import CryptoRuntimeState
 from hermes_polymarket.crypto.stale_quote_gate import evaluate_stale_quote
 from hermes_polymarket.data_sources.base import DataEvent, EventType
@@ -74,6 +75,7 @@ class PaperWatcherConfig:
     stale_quote_window_ms: int = 1500
     use_fair_value: bool = False
     fair_value_min_edge: float = 0.03
+    min_market_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -455,6 +457,23 @@ def _record_gate_rejection(
     )
 
 
+def _score_current_market(book_state: OrderBookState, market: dict[str, Any]) -> dict[str, Any]:
+    token_scores: list[float] = []
+    reasons: set[str] = set()
+    for token_id in (str(market.get("yes_token_id") or ""), str(market.get("no_token_id") or "")):
+        state = book_state.by_token.get(token_id)
+        if state is None:
+            token_scores.append(0.0)
+            reasons.add("missing_local_book_state")
+            continue
+        quality = evaluate_market_quality(state.as_orderbook())
+        score, token_reasons = _token_score(quality.to_dict())
+        token_scores.append(score)
+        reasons.update(token_reasons)
+    score = sum(token_scores) / len(token_scores) if token_scores else 0.0
+    return {"score": round(score, 4), "reasons": sorted(reasons)}
+
+
 def _mark_open_positions(
     db: Database,
     *,
@@ -684,6 +703,29 @@ async def run_crypto_paper_watcher(
                 )
                 risk_rejected += 1
                 continue
+            if config.min_market_score > 0:
+                market_score = _score_current_market(book_state, market)
+                if float(market_score["score"]) < config.min_market_score:
+                    _record_gate_rejection(
+                        db,
+                        run_id=run_id,
+                        event_id=signal.event_id,
+                        token_id=selected.token_id,
+                        market=market,
+                        direction=selected.direction,
+                        external_move_ts_ms=signal.detected_ts_ms,
+                        external_move_pct=signal.external_move_pct,
+                        amount_usd=config.amount_usd,
+                        model_probability=config.model_probability,
+                        threshold_pct=config.min_move_pct,
+                        source_consensus={"sources": list(current.sources), "max_deviation_pct": current.max_deviation_pct},
+                        final_action="market_score_rejected",
+                        reason="market_score_below_threshold",
+                        gate_payload={"market_score": {**market_score, "min_required": config.min_market_score}},
+                        fixture=config.fixture,
+                    )
+                    risk_rejected += 1
+                    continue
             if config.use_stale_quote_gate:
                 current_bbo = {"best_bid": quality.best_bid, "best_ask": quality.best_ask}
                 stale = evaluate_stale_quote(
@@ -721,7 +763,7 @@ async def run_crypto_paper_watcher(
                 reference_price = ref.get("reference_price")
                 window_end_ts = ref.get("window_end_ts")
                 if reference_price is None or window_end_ts is None or quality.best_ask is None:
-                    reason = "fair_value_missing_reference"
+                    reason = "reference_price_missing"
                     payload = {"fair_value": {"allowed": False, "reason": reason, "reference": ref}}
                 else:
                     seconds_to_expiry = max(1.0, float(window_end_ts) - signal.detected_ts_ms / 1000.0)

@@ -670,6 +670,35 @@ def cmd_learning_memory_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_learning_memory_add(args: argparse.Namespace) -> int:
+    from hermes_polymarket.learning.memory_store import MemoryRecord, MemoryStore
+
+    db, _ = _learning_db()
+    try:
+        content = json.loads(args.content_json)
+        evidence = json.loads(args.evidence_json)
+        store = MemoryStore(db)
+        store.put(
+            MemoryRecord(
+                memory_id=args.memory_id,
+                memory_type=args.memory_type,
+                status=args.status,
+                strategy_id=args.strategy_id,
+                wallet=args.wallet,
+                market_category=args.market_category,
+                content=content,
+                evidence=evidence,
+                confidence=args.confidence,
+                active_in_paper=args.active_in_paper,
+                active_in_live=False,
+            )
+        )
+        print(json.dumps({"status": "stored", "memory_id": args.memory_id, "active_in_live": False}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
 def cmd_learning_promote(args: argparse.Namespace) -> int:
     from hermes_polymarket.learning.memory_store import MemoryStore
     from hermes_polymarket.learning.promotion import promote_candidate_to_paper
@@ -1368,6 +1397,7 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                         stale_quote_window_ms=args.stale_quote_window_ms,
                         use_fair_value=args.use_fair_value,
                         fair_value_min_edge=args.fair_value_min_edge,
+                        min_market_score=args.min_market_score if args.best_markets_only else 0.0,
                     ),
                     watchlist=watchlist,
                     settings=settings,
@@ -1425,6 +1455,8 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                     "use_stale_quote_gate": args.use_stale_quote_gate,
                     "use_fair_value": args.use_fair_value,
                     "fair_value_min_edge": args.fair_value_min_edge,
+                    "strategy_version": "stale_fair_value_v2" if args.use_fair_value or args.use_stale_quote_gate or args.best_markets_only else "threshold_only_v1",
+                    "min_market_score": args.min_market_score if args.best_markets_only else None,
                 },
                 summary=summary_dict,
                 report=position_report,
@@ -1455,6 +1487,22 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
     finally:
         db.close()
     return 0
+
+
+def cmd_crypto_paper_watch_v2(args: argparse.Namespace) -> int:
+    args.best_markets_only = True
+    args.use_stale_quote_gate = True
+    args.use_fair_value = True
+    args.healthy_only = True
+    if not hasattr(args, "min_market_score"):
+        args.min_market_score = 0.75
+    if not hasattr(args, "fair_value_min_edge"):
+        args.fair_value_min_edge = 0.03
+    if not hasattr(args, "stale_quote_max_reprice_cents"):
+        args.stale_quote_max_reprice_cents = 1.0
+    if not hasattr(args, "stale_quote_window_ms"):
+        args.stale_quote_window_ms = 1500
+    return cmd_crypto_paper_watch(args)
 
 
 def cmd_crypto_paper_positions(args: argparse.Namespace) -> int:
@@ -2040,6 +2088,18 @@ def build_parser() -> argparse.ArgumentParser:
     mem_search.add_argument("--wallet", default=None)
     mem_search.add_argument("--market-category", default=None)
     mem_search.set_defaults(func=cmd_learning_memory_search)
+    mem_add = memories_sub.add_parser("add")
+    mem_add.add_argument("--memory-id", required=True)
+    mem_add.add_argument("--memory-type", default="semantic", choices=["episodic", "semantic", "procedural"])
+    mem_add.add_argument("--status", default="inactive")
+    mem_add.add_argument("--strategy-id", default=None)
+    mem_add.add_argument("--wallet", default=None)
+    mem_add.add_argument("--market-category", default=None)
+    mem_add.add_argument("--content-json", required=True)
+    mem_add.add_argument("--evidence-json", required=True)
+    mem_add.add_argument("--confidence", type=float, default=0.0)
+    mem_add.add_argument("--active-in-paper", action="store_true")
+    mem_add.set_defaults(func=cmd_learning_memory_add)
     promote = learning_sub.add_parser("promote-candidate")
     promote.add_argument("--rule-id", required=True)
     promote.add_argument("--paper-only", action="store_true")
@@ -2165,6 +2225,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_watch.add_argument("--disable-rtds", action="store_true")
     crypto_paper_watch.add_argument("--fixture", action="store_true")
     crypto_paper_watch.add_argument("--best-markets-only", action="store_true", help="Accepted for campaign-v2 protocol; use watchlist best/score before running.")
+    crypto_paper_watch.add_argument("--min-market-score", type=float, default=0.75)
     crypto_paper_watch.add_argument("--use-stale-quote-gate", action="store_true")
     crypto_paper_watch.add_argument("--stale-quote-max-reprice-cents", type=float, default=1.0)
     crypto_paper_watch.add_argument("--stale-quote-window-ms", type=int, default=1500)
@@ -2176,6 +2237,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Label this forward-paper run as restricted to market-quality-gated opportunities.",
     )
     crypto_paper_watch.set_defaults(func=cmd_crypto_paper_watch)
+    crypto_paper_watch_v2 = crypto_paper_sub.add_parser("watch-v2")
+    crypto_paper_watch_v2.add_argument("--seconds", type=int, default=900)
+    crypto_paper_watch_v2.add_argument("--symbols", default="btcusdt,xrpusdt")
+    crypto_paper_watch_v2.add_argument("--from-watchlist", action="store_true", default=True)
+    crypto_paper_watch_v2.add_argument("--max-watchlist-markets", type=int, default=20)
+    crypto_paper_watch_v2.add_argument("--amount", type=float, default=5.0)
+    crypto_paper_watch_v2.add_argument("--min-move-pct", type=float, default=0.01)
+    crypto_paper_watch_v2.add_argument("--max-age-ms", type=int, default=2500)
+    crypto_paper_watch_v2.add_argument("--max-deviation-pct", type=float, default=0.25)
+    crypto_paper_watch_v2.add_argument("--min-sources", type=int, default=2)
+    crypto_paper_watch_v2.add_argument("--cooldown-ms", type=int, default=5000)
+    crypto_paper_watch_v2.add_argument("--threshold-grid", default="0.01,0.02,0.03,0.05,0.08")
+    crypto_paper_watch_v2.add_argument("--min-strategy-threshold-pct", type=float, default=0.03)
+    crypto_paper_watch_v2.add_argument("--write-artifacts", action="store_true")
+    crypto_paper_watch_v2.add_argument("--artifact-dir", default="artifacts/campaign_v2")
+    crypto_paper_watch_v2.add_argument("--max-event-samples", type=int, default=50)
+    crypto_paper_watch_v2.add_argument("--take-profit-cents", type=float, default=8.0)
+    crypto_paper_watch_v2.add_argument("--stop-loss-cents", type=float, default=4.0)
+    crypto_paper_watch_v2.add_argument("--timeout-seconds", type=int, default=900)
+    crypto_paper_watch_v2.add_argument("--disable-rtds", action="store_true")
+    crypto_paper_watch_v2.add_argument("--fixture", action="store_true")
+    crypto_paper_watch_v2.add_argument("--healthy-only", action="store_true", default=True)
+    crypto_paper_watch_v2.add_argument("--best-markets-only", action="store_true", default=True)
+    crypto_paper_watch_v2.add_argument("--min-market-score", type=float, default=0.75)
+    crypto_paper_watch_v2.add_argument("--use-stale-quote-gate", action="store_true", default=True)
+    crypto_paper_watch_v2.add_argument("--stale-quote-max-reprice-cents", type=float, default=1.0)
+    crypto_paper_watch_v2.add_argument("--stale-quote-window-ms", type=int, default=1500)
+    crypto_paper_watch_v2.add_argument("--use-fair-value", action="store_true", default=True)
+    crypto_paper_watch_v2.add_argument("--fair-value-min-edge", type=float, default=0.03)
+    crypto_paper_watch_v2.set_defaults(func=cmd_crypto_paper_watch_v2)
     crypto_paper_positions = crypto_paper_sub.add_parser("positions")
     crypto_paper_positions.add_argument("--open", action="store_true")
     crypto_paper_positions.add_argument("--closed", action="store_true")
