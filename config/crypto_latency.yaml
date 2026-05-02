@@ -9,6 +9,15 @@ source_consensus:
   max_age_ms: 2500
   max_deviation_pct: 0.25
 
+diagnostics:
+  enabled: true
+  thresholds_pct:
+    - 0.03
+    - 0.05
+    - 0.08
+    - 0.12
+  write_artifacts: true
+
 movement:
   min_move_pct: 0.08
   lookback_ms: 3000
@@ -44,6 +53,22 @@ runtime:
   event_cooldown_ms: 5000
   max_events_per_recording: 500
   require_polymarket_bbo: true
+
+rtds:
+  enabled: true
+  endpoint: "wss://ws-live-data.polymarket.com"
+  ping_interval_seconds: 5
+  topic: "crypto_prices"
+  type: "update"
+  filters:
+    - btcusdt
+    - ethusdt
+    - solusdt
+    - xrpusdt
+  accepted_price_fields:
+    - value
+    - price
+    - last
 
 market_discovery:
   query_terms:

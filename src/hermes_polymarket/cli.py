@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import csv
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ from pathlib import Path
 import subprocess
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 from hermes_polymarket.config import load_settings
 from hermes_polymarket.execution.live_executor import LiveExecutor
@@ -756,7 +758,8 @@ def cmd_crypto_latency_record(args: argparse.Namespace) -> int:
                 from hermes_polymarket.data_sources.binance_stream import run_binance_stream
                 from hermes_polymarket.data_sources.coinbase_stream import run_coinbase_ticker
                 from hermes_polymarket.data_sources.kraken_stream import run_kraken_ticker
-                from hermes_polymarket.data_sources.polymarket_rtds import run_polymarket_rtds_crypto
+                if not args.disable_rtds:
+                    from hermes_polymarket.data_sources.polymarket_rtds import run_polymarket_rtds_crypto
 
                 coinbase_products = tuple(symbol.replace("usdt", "-USD").upper() for symbol in symbols)
                 kraken_symbols = tuple(symbol.replace("usdt", "/USD").upper() for symbol in symbols)
@@ -764,8 +767,9 @@ def cmd_crypto_latency_record(args: argparse.Namespace) -> int:
                     asyncio.create_task(run_binance_stream(bus, symbols=symbols)),
                     asyncio.create_task(run_coinbase_ticker(bus, product_ids=coinbase_products)),
                     asyncio.create_task(run_kraken_ticker(bus, symbols=kraken_symbols)),
-                    asyncio.create_task(run_polymarket_rtds_crypto(bus, symbols=symbols)),
                 ]
+                if not args.disable_rtds:
+                    tasks.append(asyncio.create_task(run_polymarket_rtds_crypto(bus, symbols=symbols)))
             try:
                 summary = await run_crypto_latency_recorder(
                     db=db,
@@ -774,6 +778,9 @@ def cmd_crypto_latency_record(args: argparse.Namespace) -> int:
                         symbols=symbols,
                         seconds=seconds,
                         min_move_pct=args.min_move_pct,
+                        max_age_ms=args.max_age_ms,
+                        max_deviation_pct=args.max_deviation_pct,
+                        min_sources=args.min_sources,
                         cooldown_ms=args.cooldown_ms,
                     ),
                 )
@@ -783,7 +790,7 @@ def cmd_crypto_latency_record(args: argparse.Namespace) -> int:
                 with contextlib.suppress(asyncio.CancelledError):
                     await asyncio.gather(*tasks)
 
-            return {
+            payload = {
                 "mode": "measurement_paper_only",
                 "data_quality": "paper_live" if not args.fixture else "local_observation",
                 "fixture": args.fixture,
@@ -791,6 +798,9 @@ def cmd_crypto_latency_record(args: argparse.Namespace) -> int:
                 "summary": summary.to_dict(),
                 "report": crypto_latency_report(db),
             }
+            if args.write_artifacts:
+                payload["artifact_dir"] = str(_write_crypto_latency_artifacts(db, payload))
+            return payload
 
         payload = asyncio.run(run_recording())
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -812,6 +822,107 @@ def cmd_crypto_latency_report(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_crypto_latency_source_health(_: argparse.Namespace) -> int:
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        rows = [dict(row) for row in db.source_health()]
+        print(json.dumps({"mode": "measurement_paper_only", "source_health": rows}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_latency_consensus(args: argparse.Namespace) -> int:
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        rows = db.conn.execute(
+            """
+            SELECT * FROM crypto_consensus_ticks
+            WHERE symbol = ?
+            ORDER BY received_ts_ms DESC, id DESC
+            LIMIT ?
+            """,
+            (args.symbol.lower(), args.last),
+        ).fetchall()
+        print(json.dumps({"mode": "measurement_paper_only", "consensus": [dict(row) for row in rows]}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_latency_events(args: argparse.Namespace) -> int:
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        if args.symbol:
+            rows = db.conn.execute(
+                """
+                SELECT * FROM crypto_latency_events
+                WHERE symbol = ?
+                ORDER BY external_move_detected_ts_ms DESC, id DESC
+                LIMIT ?
+                """,
+                (args.symbol.lower(), args.last),
+            ).fetchall()
+        else:
+            rows = db.conn.execute(
+                "SELECT * FROM crypto_latency_events ORDER BY external_move_detected_ts_ms DESC, id DESC LIMIT ?",
+                (args.last,),
+            ).fetchall()
+        print(json.dumps({"mode": "measurement_paper_only", "events": [dict(row) for row in rows]}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_latency_threshold_sweep(args: argparse.Namespace) -> int:
+    from hermes_polymarket.crypto.threshold_sweep import count_threshold_hits
+
+    thresholds = [float(value) for value in args.thresholds.split(",") if value.strip()]
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        rows = db.conn.execute(
+            """
+            SELECT received_ts_ms, consensus_price
+            FROM crypto_consensus_ticks
+            WHERE symbol = ?
+            ORDER BY received_ts_ms DESC, id DESC
+            LIMIT ?
+            """,
+            (args.symbol.lower(), args.last),
+        ).fetchall()
+        prices = [(int(row["received_ts_ms"]), float(row["consensus_price"])) for row in rows]
+        results = count_threshold_hits(
+            symbol=args.symbol.lower(),
+            prices=prices,
+            thresholds_pct=thresholds,
+            lookback_ms=args.lookback_ms,
+        )
+        print(
+            json.dumps(
+                {
+                    "mode": "measurement_paper_only",
+                    "symbol": args.symbol.lower(),
+                    "lookback_ms": args.lookback_ms,
+                    "data_points": len(prices),
+                    "threshold_sweep": [result.__dict__ for result in results],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    finally:
+        db.close()
+    return 0
+
+
 def cmd_crypto_latency_opportunities(args: argparse.Namespace) -> int:
     from hermes_polymarket.storage.crypto_latency import crypto_latency_opportunities
 
@@ -823,6 +934,60 @@ def cmd_crypto_latency_opportunities(args: argparse.Namespace) -> int:
     finally:
         db.close()
     return 0
+
+
+def _write_crypto_latency_artifacts(db: Database, payload: dict[str, Any]) -> Path:
+    run_id = f"crypto_latency_{uuid4().hex[:12]}"
+    root = Path("artifacts/crypto_latency") / run_id
+    root.mkdir(parents=True, exist_ok=True)
+
+    (root / "summary.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
+    (root / "diagnostics.json").write_text(json.dumps(payload.get("summary", {}).get("diagnostics", {}), indent=2, sort_keys=True))
+    source_health = [dict(row) for row in db.source_health()]
+    (root / "source_health.json").write_text(json.dumps(source_health, indent=2, sort_keys=True))
+
+    _write_query_csv(
+        root / "consensus_ticks.csv",
+        [dict(row) for row in db.conn.execute("SELECT * FROM crypto_consensus_ticks ORDER BY received_ts_ms DESC, id DESC LIMIT 5000")],
+    )
+    _write_query_csv(
+        root / "latency_events.csv",
+        [dict(row) for row in db.conn.execute("SELECT * FROM crypto_latency_events ORDER BY external_move_detected_ts_ms DESC, id DESC LIMIT 1000")],
+    )
+    _write_threshold_sweep_csv(root / "threshold_sweep.csv", db)
+    return root
+
+
+def _write_query_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        path.write_text("")
+        return
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_threshold_sweep_csv(path: Path, db: Database) -> None:
+    from hermes_polymarket.crypto.threshold_sweep import count_threshold_hits
+
+    rows: list[dict[str, Any]] = []
+    for symbol_row in db.conn.execute("SELECT DISTINCT symbol FROM crypto_consensus_ticks ORDER BY symbol"):
+        symbol = symbol_row["symbol"]
+        price_rows = db.conn.execute(
+            """
+            SELECT received_ts_ms, consensus_price
+            FROM crypto_consensus_ticks
+            WHERE symbol = ?
+            ORDER BY received_ts_ms DESC, id DESC
+            LIMIT 5000
+            """,
+            (symbol,),
+        ).fetchall()
+        prices = [(int(row["received_ts_ms"]), float(row["consensus_price"])) for row in price_rows]
+        for result in count_threshold_hits(symbol=symbol, prices=prices, thresholds_pct=[0.03, 0.05, 0.08, 0.12], lookback_ms=3000):
+            rows.append(result.__dict__)
+    _write_query_csv(path, rows)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -942,10 +1107,31 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_record.add_argument("--symbols", default="btcusdt,ethusdt,solusdt,xrpusdt")
     crypto_record.add_argument("--fixture", action="store_true", help="Publish deterministic local crypto events into the recorder")
     crypto_record.add_argument("--min-move-pct", type=float, default=0.08)
+    crypto_record.add_argument("--max-age-ms", type=int, default=2500)
+    crypto_record.add_argument("--max-deviation-pct", type=float, default=0.25)
+    crypto_record.add_argument("--min-sources", type=int, default=2)
     crypto_record.add_argument("--cooldown-ms", type=int, default=5000)
+    crypto_record.add_argument("--write-artifacts", action="store_true")
+    crypto_record.add_argument("--disable-rtds", action="store_true")
     crypto_record.set_defaults(func=cmd_crypto_latency_record)
     crypto_report = crypto_sub.add_parser("report")
     crypto_report.set_defaults(func=cmd_crypto_latency_report)
+    crypto_health = crypto_sub.add_parser("source-health")
+    crypto_health.set_defaults(func=cmd_crypto_latency_source_health)
+    crypto_consensus = crypto_sub.add_parser("consensus")
+    crypto_consensus.add_argument("--symbol", required=True)
+    crypto_consensus.add_argument("--last", type=int, default=20)
+    crypto_consensus.set_defaults(func=cmd_crypto_latency_consensus)
+    crypto_events = crypto_sub.add_parser("events")
+    crypto_events.add_argument("--symbol", default=None)
+    crypto_events.add_argument("--last", type=int, default=20)
+    crypto_events.set_defaults(func=cmd_crypto_latency_events)
+    crypto_sweep = crypto_sub.add_parser("threshold-sweep")
+    crypto_sweep.add_argument("--symbol", required=True)
+    crypto_sweep.add_argument("--lookback-ms", type=int, default=3000)
+    crypto_sweep.add_argument("--thresholds", default="0.03,0.05,0.08,0.12")
+    crypto_sweep.add_argument("--last", type=int, default=5000)
+    crypto_sweep.set_defaults(func=cmd_crypto_latency_threshold_sweep)
     crypto_opps = crypto_sub.add_parser("opportunities")
     crypto_opps.add_argument("--limit", type=int, default=50)
     crypto_opps.set_defaults(func=cmd_crypto_latency_opportunities)

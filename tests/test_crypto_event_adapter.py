@@ -38,6 +38,24 @@ def test_price_reading_from_coinbase_normalizes_usd_product():
     assert reading.price == 100.5
 
 
+def test_price_reading_from_rtds_prefers_value_field():
+    event = DataEvent(
+        source="polymarket_rtds",
+        event_type=EventType.RTDS_CRYPTO_PRICE,
+        event_ts_ms=1000,
+        received_ts_ms=1001,
+        key="btcusdt",
+        payload={"value": 101.25, "price": 99.0},
+    )
+
+    reading = price_reading_from_event(event)
+
+    assert reading is not None
+    assert reading.source == "polymarket_rtds"
+    assert reading.symbol == "btcusdt"
+    assert reading.price == 101.25
+
+
 def test_price_reading_from_kraken_normalizes_usd_pair():
     event = DataEvent(
         source="kraken",

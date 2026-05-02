@@ -40,7 +40,7 @@ def price_reading_from_event(event: DataEvent) -> PriceReading | None:
         return PriceReading("binance", event.key.lower(), (bid + ask) / 2.0, event.received_ts_ms, event.latency_ms)
 
     if event.event_type == EventType.RTDS_CRYPTO_PRICE:
-        raw_price = payload.get("price") or payload.get("value") or payload.get("last")
+        raw_price = payload.get("value") or payload.get("price") or payload.get("last")
         price = _float_or_none(raw_price)
         if price is None:
             return None

@@ -61,10 +61,30 @@ async def run_polymarket_rtds_crypto(
         try:
             async with websockets.connect(RTDS_WS, ping_interval=None) as ws:
                 await ws.send(json.dumps(subscription))
+                await bus.publish(
+                    DataEvent(
+                        source="polymarket_rtds",
+                        event_type=EventType.SOURCE_HEALTH,
+                        event_ts_ms=None,
+                        received_ts_ms=now_ms(),
+                        key="connected",
+                        payload={"ok": True, "subscription": subscription},
+                    )
+                )
                 keepalive = asyncio.create_task(_keepalive(ws))
                 try:
                     async for raw in ws:
                         if raw == "PONG":
+                            await bus.publish(
+                                DataEvent(
+                                    source="polymarket_rtds",
+                                    event_type=EventType.SOURCE_HEALTH,
+                                    event_ts_ms=None,
+                                    received_ts_ms=now_ms(),
+                                    key="pong",
+                                    payload={"ok": True},
+                                )
+                            )
                             continue
                         event = normalize_rtds_message(json.loads(raw))
                         if event is not None:
@@ -75,12 +95,11 @@ async def run_polymarket_rtds_crypto(
             await bus.publish(
                 DataEvent(
                     source="polymarket_rtds",
-                    event_type=EventType.RTDS_CRYPTO_PRICE,
+                    event_type=EventType.SOURCE_HEALTH,
                     event_ts_ms=None,
                     received_ts_ms=now_ms(),
                     key="connection_error",
-                    payload={"error": str(exc)},
+                    payload={"ok": False, "error": str(exc)},
                 )
             )
             await asyncio.sleep(reconnect_delay)
-

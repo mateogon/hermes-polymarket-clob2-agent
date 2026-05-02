@@ -41,6 +41,8 @@ def test_crypto_latency_recorder_records_event(tmp_path):
         assert summary.events_seen == 4
         assert summary.consensus_ticks >= 2
         assert summary.latency_events >= 1
+        assert summary.diagnostics["events_seen_by_source"]["binance"] == 2
+        assert summary.diagnostics["threshold_hits_by_symbol"]["btcusdt"]["0.03"] >= 1
         assert crypto_latency_report(db)["events"] >= 1
         db.close()
 
