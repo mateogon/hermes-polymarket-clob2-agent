@@ -9,7 +9,7 @@ from hermes_polymarket.forward_paper.lifecycle import ForwardPaperPosition
 from hermes_polymarket.storage.db import Database
 
 
-def upsert_forward_position(db: Database, pos: ForwardPaperPosition, payload: dict[str, Any] | None = None) -> None:
+def upsert_forward_position(db: Database, pos: ForwardPaperPosition, payload: dict[str, Any] | None = None, *, fixture: bool = False) -> None:
     db.conn.execute(
         """
         INSERT OR REPLACE INTO forward_paper_positions
@@ -17,8 +17,8 @@ def upsert_forward_position(db: Database, pos: ForwardPaperPosition, payload: di
            entry_ts_ms, entry_price, shares, amount_usd, best_bid_at_entry,
            best_ask_at_entry, spread_at_entry, status, exit_ts_ms, exit_price,
            exit_reason, gross_pnl, net_pnl, max_favorable_excursion,
-           max_adverse_excursion, data_quality, payload_json, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+           max_adverse_excursion, data_quality, fixture, payload_json, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
         (
             pos.position_id,
@@ -44,6 +44,7 @@ def upsert_forward_position(db: Database, pos: ForwardPaperPosition, payload: di
             pos.max_favorable_excursion,
             pos.max_adverse_excursion,
             pos.data_quality,
+            int(fixture),
             json.dumps(payload or {}, sort_keys=True),
         ),
     )
@@ -61,17 +62,29 @@ def open_forward_positions(db: Database, *, run_id: str | None = None) -> list[d
     return [dict(row) for row in rows]
 
 
-def forward_positions(db: Database, *, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+def forward_positions(
+    db: Database,
+    *,
+    run_id: str | None = None,
+    status: str | None = None,
+    include_fixture: bool = False,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    values: list[Any] = []
+    if run_id:
+        clauses.append("run_id = ?")
+        values.append(run_id)
     if status:
-        rows = db.conn.execute(
-            "SELECT * FROM forward_paper_positions WHERE status=? ORDER BY entry_ts_ms DESC LIMIT ?",
-            (status, limit),
-        )
-    else:
-        rows = db.conn.execute(
-            "SELECT * FROM forward_paper_positions ORDER BY entry_ts_ms DESC LIMIT ?",
-            (limit,),
-        )
+        clauses.append("status = ?")
+        values.append(status)
+    if not include_fixture:
+        clauses.append("fixture = 0")
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = db.conn.execute(
+        f"SELECT * FROM forward_paper_positions {where} ORDER BY entry_ts_ms DESC LIMIT ?",
+        (*values, limit),
+    )
     return [dict(row) for row in rows]
 
 
@@ -105,20 +118,96 @@ def insert_forward_mark(
     db.conn.commit()
 
 
-def forward_position_report(db: Database) -> dict[str, Any]:
-    rows = db.conn.execute("SELECT * FROM forward_paper_positions").fetchall()
-    closed = [dict(row) for row in rows if row["status"] == "closed"]
-    open_ = [dict(row) for row in rows if row["status"] == "open"]
+def insert_forward_signal(db: Database, row: dict[str, Any]) -> None:
+    db.conn.execute(
+        """
+        INSERT OR REPLACE INTO forward_paper_signals
+          (signal_id, run_id, symbol, condition_id, token_id, outcome, direction,
+           external_move_ts_ms, external_move_pct, final_action, risk_reason, fill_status,
+           best_bid, best_ask, spread, avg_price, shares, amount_usd, model_probability,
+           data_quality, fixture, payload_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row["signal_id"],
+            row["run_id"],
+            row["symbol"],
+            row.get("condition_id"),
+            row.get("token_id"),
+            row.get("outcome"),
+            row.get("direction"),
+            row["external_move_ts_ms"],
+            row.get("external_move_pct"),
+            row["final_action"],
+            row.get("risk_reason"),
+            row.get("fill_status"),
+            row.get("best_bid"),
+            row.get("best_ask"),
+            row.get("spread"),
+            row.get("avg_price"),
+            row.get("shares"),
+            row["amount_usd"],
+            row.get("model_probability"),
+            row.get("data_quality", "paper_live"),
+            int(row.get("fixture", False)),
+            json.dumps(row.get("payload", {}), sort_keys=True),
+        ),
+    )
+    db.conn.commit()
+
+
+def forward_signals(
+    db: Database,
+    *,
+    run_id: str | None = None,
+    include_fixture: bool = False,
+    rejected_only: bool = False,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    values: list[Any] = []
+    if run_id:
+        clauses.append("run_id = ?")
+        values.append(run_id)
+    if not include_fixture:
+        clauses.append("fixture = 0")
+    if rejected_only:
+        clauses.append("final_action != 'paper_fill'")
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = db.conn.execute(
+        f"SELECT * FROM forward_paper_signals {where} ORDER BY created_at DESC LIMIT ?",
+        (*values, limit),
+    )
+    return [dict(row) for row in rows]
+
+
+def forward_run_report(db: Database, *, run_id: str | None = None, include_fixture: bool = False) -> dict[str, Any]:
+    signals = forward_signals(db, run_id=run_id, include_fixture=include_fixture, limit=10_000)
+    positions = forward_positions(db, run_id=run_id, include_fixture=include_fixture, limit=10_000)
+    closed = [row for row in positions if row["status"] == "closed"]
+    open_ = [row for row in positions if row["status"] == "open"]
+    by_action_reason: dict[str, int] = {}
+    for signal in signals:
+        key = f"{signal.get('final_action')}:{signal.get('risk_reason')}"
+        by_action_reason[key] = by_action_reason.get(key, 0) + 1
     pnl = sum(float(row["net_pnl"] or 0.0) for row in closed)
     return {
         "mode": "forward_paper_only",
         "data_quality": "paper_live",
-        "positions": len(rows),
+        "run_id": run_id,
+        "include_fixture": include_fixture,
+        "signals": len(signals),
+        "positions": len(positions),
         "open": len(open_),
         "closed": len(closed),
         "net_pnl": pnl,
         "win_rate": sum(1 for row in closed if float(row["net_pnl"] or 0.0) > 0) / len(closed) if closed else 0.0,
+        "by_action_reason": by_action_reason,
     }
+
+
+def forward_position_report(db: Database, *, run_id: str | None = None, include_fixture: bool = False) -> dict[str, Any]:
+    return forward_run_report(db, run_id=run_id, include_fixture=include_fixture)
 
 
 def insert_forward_run(
@@ -131,16 +220,28 @@ def insert_forward_run(
     report: dict[str, Any],
     quality: dict[str, Any],
     artifacts: dict[str, Any],
+    requested_symbols: tuple[str, ...] | None = None,
+    requested_seconds: int | None = None,
+    actual_seconds: int | None = None,
+    fixture: bool = False,
+    exploratory_threshold: bool = False,
 ) -> None:
     db.conn.execute(
         """
         INSERT OR REPLACE INTO forward_paper_runs
-          (run_id, symbols_json, config_json, summary_json, report_json, quality_json, artifacts_json, ended_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+          (run_id, symbols_json, requested_symbols_json, requested_seconds, actual_seconds,
+           fixture, exploratory_threshold, config_json, summary_json, report_json,
+           quality_json, artifacts_json, ended_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
         (
             run_id,
             json.dumps(list(symbols), sort_keys=True),
+            json.dumps(list(requested_symbols or symbols), sort_keys=True),
+            requested_seconds,
+            actual_seconds,
+            int(fixture),
+            int(exploratory_threshold),
             json.dumps(config, sort_keys=True),
             json.dumps(summary, sort_keys=True),
             json.dumps(report, sort_keys=True),
@@ -151,9 +252,10 @@ def insert_forward_run(
     db.conn.commit()
 
 
-def forward_runs(db: Database, *, limit: int = 20) -> list[dict[str, Any]]:
+def forward_runs(db: Database, *, include_fixture: bool = False, limit: int = 20) -> list[dict[str, Any]]:
+    where = "" if include_fixture else "WHERE fixture = 0"
     rows = db.conn.execute(
-        "SELECT * FROM forward_paper_runs ORDER BY started_at DESC LIMIT ?",
+        f"SELECT * FROM forward_paper_runs {where} ORDER BY started_at DESC LIMIT ?",
         (limit,),
     )
     return [dict(row) for row in rows]
@@ -165,13 +267,4 @@ def forward_run(db: Database, run_id: str) -> dict[str, Any] | None:
 
 
 def forward_signals_for_run(db: Database, run_id: str, *, limit: int = 500) -> list[dict[str, Any]]:
-    rows = db.conn.execute(
-        """
-        SELECT * FROM crypto_latency_events
-        WHERE payload_json LIKE ?
-        ORDER BY external_move_detected_ts_ms DESC
-        LIMIT ?
-        """,
-        (f"%{run_id}%", limit),
-    )
-    return [dict(row) for row in rows]
+    return forward_signals(db, run_id=run_id, include_fixture=True, limit=limit)

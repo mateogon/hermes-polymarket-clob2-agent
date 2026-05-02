@@ -14,6 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from hermes_polymarket.config import Settings, load_settings
+from hermes_polymarket.crypto.directional_mapping import DirectionalToken, desired_direction_from_move, select_directional_token
 from hermes_polymarket.crypto.event_adapter import price_reading_from_event
 from hermes_polymarket.crypto.runtime_state import CryptoRuntimeState
 from hermes_polymarket.data_sources.base import DataEvent, EventType
@@ -42,7 +43,7 @@ from hermes_polymarket.storage.crypto_latency import (
 )
 from hermes_polymarket.storage.crypto_watchlist import crypto_market_watchlist
 from hermes_polymarket.storage.db import Database
-from hermes_polymarket.storage.forward_positions import insert_forward_mark, upsert_forward_position
+from hermes_polymarket.storage.forward_positions import insert_forward_mark, insert_forward_signal, upsert_forward_position
 from hermes_polymarket.storage.l2 import persist_l2_event
 
 
@@ -62,6 +63,7 @@ class PaperWatcherConfig:
     calibration_thresholds_pct: tuple[float, ...] = (0.01, 0.02, 0.03, 0.05, 0.08)
     cooldown_ms: int = 5000
     max_events: int = 500
+    fixture: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,8 +101,18 @@ def token_market_map(watchlist: list[dict[str, Any]]) -> dict[str, dict[str, Any
     return mapping
 
 
-def _tokens_for_symbol(token_map: dict[str, dict[str, Any]], symbol: str) -> list[tuple[str, dict[str, Any]]]:
-    return [(token_id, market) for token_id, market in token_map.items() if str(market.get("symbol", "")).lower() == symbol]
+def directional_tokens(watchlist: list[dict[str, Any]]) -> list[DirectionalToken]:
+    tokens: list[DirectionalToken] = []
+    for market in watchlist:
+        symbol = str(market.get("symbol") or "").lower()
+        condition_id = str(market.get("condition_id") or "")
+        up_token = market.get("up_token_id")
+        down_token = market.get("down_token_id")
+        if up_token:
+            tokens.append(DirectionalToken(symbol, condition_id, str(up_token), "UP", "up"))
+        if down_token:
+            tokens.append(DirectionalToken(symbol, condition_id, str(down_token), "DOWN", "down"))
+    return tokens
 
 
 def _persist_signal_event(
@@ -144,12 +156,15 @@ def _record_token_opportunity(
     event_id: str,
     token_id: str,
     market: dict[str, Any],
+    direction: str,
     book_state: OrderBookState,
     amount_usd: float,
     external_move_ts_ms: int,
+    external_move_pct: float,
     model_probability: float,
     settings: Settings,
     open_position_count: int,
+    fixture: bool,
 ) -> tuple[int, int, int, ForwardPaperPosition | None]:
     state = book_state.by_token.get(token_id)
     fill = None
@@ -211,6 +226,7 @@ def _record_token_opportunity(
             "condition_id": market.get("condition_id"),
             "slug": market.get("slug"),
             "symbol": market.get("symbol"),
+            "direction": direction,
             "external_move_ts_ms": external_move_ts_ms,
             "best_bid": state.best_bid if state else None,
             "best_ask": state.best_ask if state else None,
@@ -219,6 +235,32 @@ def _record_token_opportunity(
         },
     }
     insert_crypto_latency_opportunity(db, row)
+    insert_forward_signal(
+        db,
+        {
+            "signal_id": event_id,
+            "run_id": run_id,
+            "symbol": str(market.get("symbol") or ""),
+            "condition_id": str(market.get("condition_id") or ""),
+            "token_id": token_id,
+            "outcome": str(market.get("outcome") or ""),
+            "direction": direction,
+            "external_move_ts_ms": external_move_ts_ms,
+            "external_move_pct": external_move_pct,
+            "final_action": "paper_fill" if risk_allowed else "risk_rejected",
+            "risk_reason": risk_reason,
+            "fill_status": row["fill_status"],
+            "best_bid": state.best_bid if state else None,
+            "best_ask": state.best_ask if state else None,
+            "spread": state.spread if state else None,
+            "avg_price": fill.avg_price if fill else None,
+            "shares": fill.total_shares if fill else None,
+            "amount_usd": amount_usd,
+            "model_probability": model_probability,
+            "fixture": fixture,
+            "payload": {"risk_explanation": risk_explanation},
+        },
+    )
     signal = ForwardPaperSignal(
         signal_id=event_id,
         run_id=run_id,
@@ -284,7 +326,7 @@ def _mark_open_positions(
         )
         if should_exit:
             final_position = close_position(marked, ts_ms=event.received_ts_ms, exit_price=mark_price, reason=reason)
-            upsert_forward_position(db, final_position, payload={"source": "forward_paper_watcher"})
+            upsert_forward_position(db, final_position, payload={"source": "forward_paper_watcher"}, fixture=config.fixture)
             db.add_journal(
                 "forward_paper_close",
                 "Closed forward paper position",
@@ -300,7 +342,7 @@ def _mark_open_positions(
             closed += 1
         else:
             positions[position_id] = marked
-            upsert_forward_position(db, marked, payload={"source": "forward_paper_watcher"})
+            upsert_forward_position(db, marked, payload={"source": "forward_paper_watcher"}, fixture=config.fixture)
     return marks, closed
 
 
@@ -319,6 +361,7 @@ async def run_crypto_paper_watcher(
     book_state = book_state or OrderBookState()
     watchlist = watchlist if watchlist is not None else crypto_market_watchlist(db, active_only=True, limit=100)
     token_map = token_market_map(watchlist)
+    directional = directional_tokens(watchlist)
     runtime_state.token_to_market.update(token_map)
     run_id = f"crypto_paper_{uuid4().hex[:12]}"
     open_positions: dict[str, ForwardPaperPosition] = {}
@@ -405,13 +448,13 @@ async def run_crypto_paper_watcher(
         runtime_state.last_event_ts_by_symbol[current.symbol] = event.received_ts_ms
         signals_generated += 1
         latency_events += 1
-        matched = _tokens_for_symbol(token_map, current.symbol)
-        first_market = matched[0][1] if matched else None
+        selected = select_directional_token(tokens=directional, symbol=current.symbol, move_pct=signal.external_move_pct)
+        market = token_map.get(selected.token_id) if selected else None
         _persist_signal_event(
             db,
             event_id=signal.event_id,
             symbol=signal.symbol,
-            market=first_market,
+            market=market,
             external_move_pct=signal.external_move_pct,
             detected_ts_ms=signal.detected_ts_ms,
             reference_price=signal.reference_price,
@@ -420,26 +463,51 @@ async def run_crypto_paper_watcher(
             run_id=run_id,
         )
 
-        for token_id, market in matched:
+        if selected is None or market is None:
+            insert_forward_signal(
+                db,
+                {
+                    "signal_id": signal.event_id,
+                    "run_id": run_id,
+                    "symbol": signal.symbol,
+                    "condition_id": None,
+                    "token_id": None,
+                    "outcome": None,
+                    "direction": desired_direction_from_move(signal.external_move_pct),
+                    "external_move_ts_ms": signal.detected_ts_ms,
+                    "external_move_pct": signal.external_move_pct,
+                    "final_action": "risk_rejected",
+                    "risk_reason": "direction_mapping_missing" if not directional else "direction_mapping_ambiguous",
+                    "fill_status": None,
+                    "amount_usd": config.amount_usd,
+                    "model_probability": config.model_probability,
+                    "fixture": config.fixture,
+                },
+            )
+            risk_rejected += 1
+        else:
             opp_delta, fill_delta, reject_delta, position = _record_token_opportunity(
                 db,
                 run_id=run_id,
                 event_id=signal.event_id,
-                token_id=token_id,
+                token_id=selected.token_id,
                 market=market,
+                direction=selected.direction,
                 book_state=book_state,
                 amount_usd=config.amount_usd,
                 external_move_ts_ms=signal.detected_ts_ms,
+                external_move_pct=signal.external_move_pct,
                 model_probability=config.model_probability,
                 settings=settings,
                 open_position_count=len(open_positions),
+                fixture=config.fixture,
             )
             opportunities += opp_delta
             fills += fill_delta
             risk_rejected += reject_delta
             if position is not None:
                 open_positions[position.position_id] = position
-                upsert_forward_position(db, position, payload={"source": "forward_paper_watcher"})
+                upsert_forward_position(db, position, payload={"source": "forward_paper_watcher"}, fixture=config.fixture)
                 db.add_journal(
                     "forward_paper_open",
                     "Opened forward paper position",

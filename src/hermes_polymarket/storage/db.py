@@ -37,6 +37,54 @@ class Database:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(wallet_scores)")}
         if columns and "warnings_json" not in columns:
             self.conn.execute("ALTER TABLE wallet_scores ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_columns(
+            "crypto_market_watchlist",
+            {
+                "up_token_id": "TEXT",
+                "down_token_id": "TEXT",
+                "direction_map_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
+        )
+        self._ensure_columns("forward_paper_positions", {"fixture": "INTEGER NOT NULL DEFAULT 0"})
+        self._ensure_columns(
+            "forward_paper_runs",
+            {
+                "requested_symbols_json": "TEXT NOT NULL DEFAULT '[]'",
+                "requested_seconds": "INTEGER",
+                "actual_seconds": "INTEGER",
+                "fixture": "INTEGER NOT NULL DEFAULT 0",
+                "exploratory_threshold": "INTEGER NOT NULL DEFAULT 0",
+            },
+        )
+        if self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='forward_paper_positions'").fetchone():
+            self.conn.execute(
+                """
+                UPDATE forward_paper_positions
+                SET fixture = 1
+                WHERE fixture = 0
+                  AND (token_id LIKE 'fixture-%' OR condition_id = 'fixture-condition')
+                """
+            )
+        if self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='forward_paper_runs'").fetchone():
+            self.conn.execute(
+                """
+                UPDATE forward_paper_runs
+                SET fixture = 1
+                WHERE fixture = 0
+                  AND run_id IN (
+                    SELECT DISTINCT run_id FROM forward_paper_positions WHERE fixture = 1
+                  )
+                """
+            )
+
+    def _ensure_columns(self, table: str, specs: dict[str, str]) -> None:
+        exists = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        if not exists:
+            return
+        columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        for column, ddl in specs.items():
+            if column not in columns:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def account(self) -> sqlite3.Row:
         row = self.conn.execute("SELECT * FROM account WHERE id = 1").fetchone()

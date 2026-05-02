@@ -321,6 +321,9 @@ CREATE TABLE IF NOT EXISTS crypto_market_watchlist (
   symbol TEXT NOT NULL,
   yes_token_id TEXT NOT NULL,
   no_token_id TEXT NOT NULL,
+  up_token_id TEXT,
+  down_token_id TEXT,
+  direction_map_json TEXT NOT NULL DEFAULT '{}',
   active INTEGER NOT NULL DEFAULT 1,
   discovered_at_ms INTEGER NOT NULL,
   end_ts_ms INTEGER,
@@ -460,6 +463,7 @@ CREATE TABLE IF NOT EXISTS forward_paper_positions (
   max_favorable_excursion REAL NOT NULL DEFAULT 0,
   max_adverse_excursion REAL NOT NULL DEFAULT 0,
   data_quality TEXT NOT NULL DEFAULT 'paper_live',
+  fixture INTEGER NOT NULL DEFAULT 0,
   payload_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -485,6 +489,11 @@ CREATE TABLE IF NOT EXISTS forward_paper_runs (
   mode TEXT NOT NULL DEFAULT 'forward_paper_only',
   data_quality TEXT NOT NULL DEFAULT 'paper_live',
   symbols_json TEXT NOT NULL,
+  requested_symbols_json TEXT NOT NULL DEFAULT '[]',
+  requested_seconds INTEGER,
+  actual_seconds INTEGER,
+  fixture INTEGER NOT NULL DEFAULT 0,
+  exploratory_threshold INTEGER NOT NULL DEFAULT 0,
   config_json TEXT NOT NULL DEFAULT '{}',
   summary_json TEXT NOT NULL DEFAULT '{}',
   report_json TEXT NOT NULL DEFAULT '{}',
@@ -492,5 +501,32 @@ CREATE TABLE IF NOT EXISTS forward_paper_runs (
   artifacts_json TEXT NOT NULL DEFAULT '{}',
   started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   ended_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS forward_paper_signals (
+  signal_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  condition_id TEXT,
+  token_id TEXT,
+  outcome TEXT,
+  direction TEXT,
+  external_move_ts_ms INTEGER NOT NULL,
+  external_move_pct REAL,
+  final_action TEXT NOT NULL,
+  risk_reason TEXT,
+  fill_status TEXT,
+  best_bid REAL,
+  best_ask REAL,
+  spread REAL,
+  avg_price REAL,
+  shares REAL,
+  amount_usd REAL NOT NULL,
+  model_probability REAL,
+  data_quality TEXT NOT NULL DEFAULT 'paper_live',
+  fixture INTEGER NOT NULL DEFAULT 0,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY(signal_id, token_id, final_action)
 );
 """

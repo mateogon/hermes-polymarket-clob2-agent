@@ -919,6 +919,14 @@ def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
     db.init_schema(settings.initial_bankroll)
     try:
         if args.watchlist_action == "add":
+            up_token_id = args.up_token_id
+            down_token_id = args.down_token_id
+            if args.yes_direction == "up":
+                up_token_id = up_token_id or args.yes_token_id
+                down_token_id = down_token_id or args.no_token_id
+            elif args.yes_direction == "down":
+                up_token_id = up_token_id or args.no_token_id
+                down_token_id = down_token_id or args.yes_token_id
             upsert_crypto_market_watchlist(
                 db,
                 {
@@ -928,6 +936,9 @@ def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
                     "symbol": args.symbol.lower(),
                     "yes_token_id": args.yes_token_id,
                     "no_token_id": args.no_token_id,
+                    "up_token_id": up_token_id,
+                    "down_token_id": down_token_id,
+                    "direction_map": {"up": up_token_id, "down": down_token_id} if up_token_id and down_token_id else {},
                     "active": True,
                     "discovered_at_ms": now_ms(),
                     "raw": {"manual": True},
@@ -1106,6 +1117,8 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                     "symbol": symbols[0],
                     "yes_token_id": "fixture-yes-token",
                     "no_token_id": "fixture-no-token",
+                    "up_token_id": "fixture-yes-token",
+                    "down_token_id": "fixture-no-token",
                     "active": 1,
                 }
             ]
@@ -1220,6 +1233,7 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                         take_profit_cents=args.take_profit_cents,
                         stop_loss_cents=args.stop_loss_cents,
                         timeout_seconds=args.timeout_seconds,
+                        fixture=args.fixture,
                     ),
                     watchlist=watchlist,
                     settings=settings,
@@ -1231,19 +1245,26 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                     await asyncio.gather(*tasks)
 
             summary_dict = summary.to_dict()
-            position_report = forward_position_report(db)
+            position_report = forward_position_report(db, run_id=summary.run_id, include_fixture=args.fixture)
+            warnings = forward_paper_quality_warnings(
+                signals=summary.signals_generated,
+                closed_positions=summary.positions_closed,
+                min_move_pct=args.min_move_pct,
+                min_strategy_threshold_pct=args.min_strategy_threshold_pct,
+            )
+            if args.seconds != seconds:
+                warnings.append("duration_capped_by_config")
             quality = {
-                "warnings": forward_paper_quality_warnings(
-                    signals=summary.signals_generated,
-                    closed_positions=summary.positions_closed,
-                    min_move_pct=args.min_move_pct,
-                    min_strategy_threshold_pct=args.min_strategy_threshold_pct,
-                ),
+                "warnings": warnings,
                 "threshold_calibration": summary.threshold_calibration,
                 "exploratory_threshold": args.min_move_pct < args.min_strategy_threshold_pct,
+                "requested_seconds": args.seconds,
+                "actual_seconds": seconds,
+                "duration_capped": args.seconds != seconds,
+                "cap_reason": "config.max_record_seconds" if args.seconds != seconds else None,
             }
             signals = forward_signals_for_run(db, summary.run_id, limit=args.max_event_samples)
-            positions = forward_positions(db, limit=500)
+            positions = forward_positions(db, run_id=summary.run_id, include_fixture=args.fixture, limit=500)
             artifacts: dict[str, str] = {}
             if args.write_artifacts:
                 artifacts = write_forward_paper_artifacts(
@@ -1261,6 +1282,7 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                 symbols=symbols,
                 config={
                     "seconds": seconds,
+                    "requested_seconds": args.seconds,
                     "amount_usd": args.amount,
                     "min_move_pct": args.min_move_pct,
                     "min_strategy_threshold_pct": args.min_strategy_threshold_pct,
@@ -1270,6 +1292,11 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                 report=position_report,
                 quality=quality,
                 artifacts=artifacts,
+                requested_symbols=symbols,
+                requested_seconds=args.seconds,
+                actual_seconds=seconds,
+                fixture=args.fixture,
+                exploratory_threshold=args.min_move_pct < args.min_strategy_threshold_pct,
             )
             return {
                 "mode": "forward_paper_only",
@@ -1299,21 +1326,47 @@ def cmd_crypto_paper_positions(args: argparse.Namespace) -> int:
     db.init_schema(settings.initial_bankroll)
     try:
         status = "open" if args.open else "closed" if args.closed else None
-        rows = forward_positions(db, status=status, limit=args.limit)
-        print(json.dumps({"mode": "forward_paper_only", "data_quality": "paper_live", "positions": rows}, indent=2, sort_keys=True))
+        rows = forward_positions(db, run_id=args.run_id, status=status, include_fixture=args.include_fixture, limit=args.limit)
+        print(
+            json.dumps(
+                {
+                    "mode": "forward_paper_only",
+                    "data_quality": "paper_live",
+                    "run_id": args.run_id,
+                    "include_fixture": args.include_fixture,
+                    "positions": rows,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
     finally:
         db.close()
     return 0
 
 
-def cmd_crypto_paper_report(_: argparse.Namespace) -> int:
-    from hermes_polymarket.storage.forward_positions import forward_position_report
+def cmd_crypto_paper_report(args: argparse.Namespace) -> int:
+    from hermes_polymarket.storage.forward_positions import forward_run_report
 
     settings = _settings()
     db = Database(settings.database_path)
     db.init_schema(settings.initial_bankroll)
     try:
-        print(json.dumps(forward_position_report(db), indent=2, sort_keys=True))
+        print(json.dumps(forward_run_report(db, run_id=args.run_id, include_fixture=args.include_fixture), indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_paper_signals(args: argparse.Namespace) -> int:
+    from hermes_polymarket.storage.forward_positions import forward_signals
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        rows = forward_signals(db, run_id=args.run_id, include_fixture=args.include_fixture, rejected_only=args.rejected_only, limit=args.last)
+        print(json.dumps({"mode": "forward_paper_only", "run_id": args.run_id, "signals": rows}, indent=2, sort_keys=True))
     finally:
         db.close()
     return 0
@@ -1326,7 +1379,7 @@ def cmd_crypto_paper_runs(args: argparse.Namespace) -> int:
     db = Database(settings.database_path)
     db.init_schema(settings.initial_bankroll)
     try:
-        print(json.dumps({"mode": "forward_paper_only", "runs": forward_runs(db, limit=args.limit)}, indent=2, sort_keys=True))
+        print(json.dumps({"mode": "forward_paper_only", "runs": forward_runs(db, include_fixture=args.include_fixture, limit=args.limit)}, indent=2, sort_keys=True))
     finally:
         db.close()
     return 0
@@ -1716,6 +1769,9 @@ def build_parser() -> argparse.ArgumentParser:
     watchlist_add.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
     watchlist_add.add_argument("--yes-token-id", required=True)
     watchlist_add.add_argument("--no-token-id", required=True)
+    watchlist_add.add_argument("--up-token-id", default=None)
+    watchlist_add.add_argument("--down-token-id", default=None)
+    watchlist_add.add_argument("--yes-direction", choices=["up", "down"], default=None)
     watchlist_add.add_argument("--question", default=None)
     watchlist_clear = watchlist_sub.add_parser("clear")
     crypto_watchlist.set_defaults(func=cmd_crypto_latency_watchlist)
@@ -1776,12 +1832,30 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_positions = crypto_paper_sub.add_parser("positions")
     crypto_paper_positions.add_argument("--open", action="store_true")
     crypto_paper_positions.add_argument("--closed", action="store_true")
+    crypto_paper_positions.add_argument("--run-id", default=None)
+    crypto_paper_positions.add_argument("--include-fixture", action="store_true")
     crypto_paper_positions.add_argument("--limit", type=int, default=100)
     crypto_paper_positions.set_defaults(func=cmd_crypto_paper_positions)
     crypto_paper_report = crypto_paper_sub.add_parser("report")
+    crypto_paper_report.add_argument("--run-id", default=None)
+    crypto_paper_report.add_argument("--include-fixture", action="store_true")
+    crypto_paper_report.add_argument("--aggregate", action="store_true")
     crypto_paper_report.set_defaults(func=cmd_crypto_paper_report)
+    crypto_paper_signals = crypto_paper_sub.add_parser("signals")
+    crypto_paper_signals.add_argument("--run-id", default=None)
+    crypto_paper_signals.add_argument("--last", type=int, default=50)
+    crypto_paper_signals.add_argument("--include-fixture", action="store_true")
+    crypto_paper_signals.set_defaults(rejected_only=False)
+    crypto_paper_signals.set_defaults(func=cmd_crypto_paper_signals)
+    crypto_paper_rejected = crypto_paper_sub.add_parser("rejected")
+    crypto_paper_rejected.add_argument("--run-id", default=None)
+    crypto_paper_rejected.add_argument("--last", type=int, default=50)
+    crypto_paper_rejected.add_argument("--include-fixture", action="store_true")
+    crypto_paper_rejected.set_defaults(rejected_only=True)
+    crypto_paper_rejected.set_defaults(func=cmd_crypto_paper_signals)
     crypto_paper_runs = crypto_paper_sub.add_parser("runs")
     crypto_paper_runs.add_argument("--limit", type=int, default=20)
+    crypto_paper_runs.add_argument("--include-fixture", action="store_true")
     crypto_paper_runs.set_defaults(func=cmd_crypto_paper_runs)
     crypto_paper_artifacts = crypto_paper_sub.add_parser("artifacts")
     crypto_paper_artifacts.add_argument("--run-id", required=True)

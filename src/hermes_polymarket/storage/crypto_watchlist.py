@@ -9,16 +9,22 @@ from hermes_polymarket.storage.db import Database
 
 
 def upsert_crypto_market_watchlist(db: Database, row: dict[str, Any]) -> None:
+    direction_map = dict(row.get("direction_map", {}))
+    up_token_id = row.get("up_token_id") or direction_map.get("up")
+    down_token_id = row.get("down_token_id") or direction_map.get("down")
     db.conn.execute(
         """
         INSERT INTO crypto_market_watchlist
           (condition_id, slug, question, symbol, yes_token_id, no_token_id,
-           active, discovered_at_ms, end_ts_ms, raw_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           up_token_id, down_token_id, direction_map_json, active, discovered_at_ms, end_ts_ms, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(condition_id, yes_token_id, no_token_id) DO UPDATE SET
           slug = excluded.slug,
           question = excluded.question,
           symbol = excluded.symbol,
+          up_token_id = excluded.up_token_id,
+          down_token_id = excluded.down_token_id,
+          direction_map_json = excluded.direction_map_json,
           active = excluded.active,
           end_ts_ms = excluded.end_ts_ms,
           raw_json = excluded.raw_json
@@ -30,6 +36,9 @@ def upsert_crypto_market_watchlist(db: Database, row: dict[str, Any]) -> None:
             row["symbol"],
             row["yes_token_id"],
             row["no_token_id"],
+            up_token_id,
+            down_token_id,
+            json.dumps(direction_map, sort_keys=True),
             int(row.get("active", True)),
             int(row["discovered_at_ms"]),
             row.get("end_ts_ms"),
