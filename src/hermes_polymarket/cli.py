@@ -1058,6 +1058,134 @@ def cmd_crypto_latency_opportunities(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_l2_recorder_start(args: argparse.Namespace) -> int:
+    from hermes_polymarket.crypto.l2_recorder import run_l2_recorder
+    from hermes_polymarket.data_sources.base import DataEvent, EventType, now_ms
+    from hermes_polymarket.data_sources.event_bus import EventBus
+    from hermes_polymarket.data_sources.polymarket_market_ws import run_polymarket_market_ws
+    from hermes_polymarket.storage.crypto_watchlist import watchlist_token_ids
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        token_ids = tuple(args.token_id or ())
+        if args.from_crypto_watchlist:
+            token_ids = (*token_ids, *watchlist_token_ids(db, active_only=True, limit=args.max_watchlist_markets))
+        token_ids = tuple(dict.fromkeys(token_ids))
+        if not token_ids:
+            print("No token IDs found. Run crypto-latency discover or crypto-latency watchlist add first.")
+            return 2
+
+        async def publish_fixture(bus: EventBus, token_id: str) -> None:
+            ts = now_ms()
+            await bus.publish(
+                DataEvent(
+                    source="fixture_market_ws",
+                    event_type=EventType.POLY_BOOK,
+                    event_ts_ms=ts,
+                    received_ts_ms=ts,
+                    key=token_id,
+                    payload={
+                        "asset_id": token_id,
+                        "bids": [{"price": "0.49", "size": "10"}],
+                        "asks": [{"price": "0.51", "size": "10"}],
+                    },
+                )
+            )
+            await bus.publish(
+                DataEvent(
+                    source="fixture_market_ws",
+                    event_type=EventType.POLY_BEST_BID_ASK,
+                    event_ts_ms=ts + 50,
+                    received_ts_ms=ts + 50,
+                    key=token_id,
+                    payload={"asset_id": token_id, "bid": "0.49", "ask": "0.51"},
+                )
+            )
+            await bus.publish(
+                DataEvent(
+                    source="fixture_market_ws",
+                    event_type=EventType.POLY_PRICE_CHANGE,
+                    event_ts_ms=ts + 100,
+                    received_ts_ms=ts + 100,
+                    key=token_id,
+                    payload={"asset_id": token_id, "side": "ask", "price": "0.51", "size": "0", "removed": True},
+                )
+            )
+
+        async def run() -> dict[str, Any]:
+            bus = EventBus()
+            producer: asyncio.Task[None] | None = None
+            if args.fixture:
+                await publish_fixture(bus, token_ids[0])
+            else:
+                producer = asyncio.create_task(run_polymarket_market_ws(bus, asset_ids=token_ids))
+            try:
+                summary = await run_l2_recorder(db=db, bus=bus, token_ids=token_ids, seconds=args.seconds)
+            finally:
+                if producer is not None:
+                    producer.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await producer
+            return {"mode": "local_l2_paper_only", "fixture": args.fixture, "token_ids": token_ids, "summary": summary.to_dict()}
+
+        print(json.dumps(asyncio.run(run()), indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_l2_recorder_status(args: argparse.Namespace) -> int:
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        runs = [
+            dict(row)
+            for row in db.conn.execute(
+                "SELECT * FROM l2_recorder_runs ORDER BY started_at DESC LIMIT ?",
+                (args.limit,),
+            )
+        ]
+        counts = {
+            "snapshots": db.conn.execute("SELECT COUNT(*) AS n FROM l2_book_snapshots").fetchone()["n"],
+            "deltas": db.conn.execute("SELECT COUNT(*) AS n FROM l2_price_changes").fetchone()["n"],
+            "bbo": db.conn.execute("SELECT COUNT(*) AS n FROM l2_bbo_updates").fetchone()["n"],
+        }
+        print(json.dumps({"mode": "local_l2_paper_only", "counts": counts, "runs": runs}, indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_l2_recorder_reconstruct(args: argparse.Namespace) -> int:
+    from hermes_polymarket.backtest.local_l2_lookup import nearest_bbo_before, reconstruct_book_at
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        state = reconstruct_book_at(db, token_id=args.token_id, target_ts_ms=args.timestamp_ms)
+        token_state = state.by_token.get(args.token_id) if state is not None else None
+        payload = {
+            "mode": "local_l2_paper_only",
+            "token_id": args.token_id,
+            "timestamp_ms": args.timestamp_ms,
+            "book_found": token_state is not None,
+            "best_bid": token_state.best_bid if token_state else None,
+            "best_ask": token_state.best_ask if token_state else None,
+            "spread": token_state.spread if token_state else None,
+            "bids": len(token_state.bids) if token_state else 0,
+            "asks": len(token_state.asks) if token_state else 0,
+            "nearest_bbo": nearest_bbo_before(db, token_id=args.token_id, target_ts_ms=args.timestamp_ms),
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0 if token_state is not None else 2
+    finally:
+        db.close()
+
+
 def _write_crypto_latency_artifacts(db: Database, payload: dict[str, Any]) -> Path:
     run_id = f"crypto_latency_{uuid4().hex[:12]}"
     root = Path("artifacts/crypto_latency") / run_id
@@ -1280,6 +1408,23 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_opps = crypto_sub.add_parser("opportunities")
     crypto_opps.add_argument("--limit", type=int, default=50)
     crypto_opps.set_defaults(func=cmd_crypto_latency_opportunities)
+
+    l2 = sub.add_parser("l2-recorder")
+    l2_sub = l2.add_subparsers(dest="l2_command", required=True)
+    l2_start = l2_sub.add_parser("start")
+    l2_start.add_argument("--token-id", action="append", default=[])
+    l2_start.add_argument("--from-crypto-watchlist", action="store_true")
+    l2_start.add_argument("--max-watchlist-markets", type=int, default=20)
+    l2_start.add_argument("--seconds", type=int, default=300)
+    l2_start.add_argument("--fixture", action="store_true")
+    l2_start.set_defaults(func=cmd_l2_recorder_start)
+    l2_status = l2_sub.add_parser("status")
+    l2_status.add_argument("--limit", type=int, default=10)
+    l2_status.set_defaults(func=cmd_l2_recorder_status)
+    l2_reconstruct = l2_sub.add_parser("reconstruct")
+    l2_reconstruct.add_argument("--token-id", required=True)
+    l2_reconstruct.add_argument("--timestamp-ms", type=int, required=True)
+    l2_reconstruct.set_defaults(func=cmd_l2_recorder_reconstruct)
 
     dry = sub.add_parser("dry-run")
     dry.add_argument("--market", default=None, help="Market identifier: slug, condition ID, token ID, or search text")

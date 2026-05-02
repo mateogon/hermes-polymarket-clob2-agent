@@ -376,4 +376,63 @@ CREATE TABLE IF NOT EXISTS crypto_latency_opportunities (
   payload_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS l2_book_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_id TEXT NOT NULL,
+  event_ts_ms INTEGER,
+  received_ts_ms INTEGER NOT NULL,
+  bids_json TEXT NOT NULL,
+  asks_json TEXT NOT NULL,
+  raw_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_l2_book_snapshots_token_ts
+ON l2_book_snapshots(token_id, received_ts_ms);
+
+CREATE TABLE IF NOT EXISTS l2_price_changes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_id TEXT NOT NULL,
+  market TEXT,
+  side TEXT NOT NULL,
+  price REAL NOT NULL,
+  size REAL NOT NULL,
+  removed INTEGER NOT NULL DEFAULT 0,
+  event_ts_ms INTEGER,
+  received_ts_ms INTEGER NOT NULL,
+  raw_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_l2_price_changes_token_ts
+ON l2_price_changes(token_id, received_ts_ms);
+
+CREATE TABLE IF NOT EXISTS l2_bbo_updates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_id TEXT NOT NULL,
+  best_bid REAL,
+  best_ask REAL,
+  spread REAL,
+  event_ts_ms INTEGER,
+  received_ts_ms INTEGER NOT NULL,
+  raw_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_l2_bbo_updates_token_ts
+ON l2_bbo_updates(token_id, received_ts_ms);
+
+CREATE TABLE IF NOT EXISTS l2_recorder_runs (
+  run_id TEXT PRIMARY KEY,
+  token_ids_json TEXT NOT NULL,
+  seconds INTEGER NOT NULL,
+  events_seen INTEGER NOT NULL DEFAULT 0,
+  snapshots_seen INTEGER NOT NULL DEFAULT 0,
+  deltas_seen INTEGER NOT NULL DEFAULT 0,
+  bbo_seen INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  status TEXT NOT NULL
+);
 """
