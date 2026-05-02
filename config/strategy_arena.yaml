@@ -1,0 +1,56 @@
+arena:
+  mode: diagnostic_paper
+  baseline: no_trade
+  artifact_dir: artifacts/strategy_arena
+  min_signals_for_claim: 50
+  min_closed_positions_for_claim: 20
+  exclude_fixture_by_default: true
+
+strategies:
+  - id: no_trade
+    type: baseline
+    label: baseline
+
+  - id: threshold_001_exploratory
+    type: threshold_filter
+    source: forward_paper
+    min_move_pct: 0.01
+    label: exploratory
+
+  - id: threshold_0015_exploratory
+    type: threshold_filter
+    source: forward_paper
+    min_move_pct: 0.015
+    label: exploratory
+
+  - id: threshold_002_candidate
+    type: threshold_filter
+    source: forward_paper
+    min_move_pct: 0.02
+    label: stricter_candidate
+
+  - id: btc_only
+    type: symbol_filter
+    source: forward_paper
+    symbols:
+      - btcusdt
+
+  - id: xrp_only
+    type: symbol_filter
+    source: forward_paper
+    symbols:
+      - xrpusdt
+
+  - id: quality_rejected_analysis
+    type: reject_reason_analysis
+    source: forward_paper
+    reject_reasons:
+      - market_quality_rejected
+      - thin_depth_2pct
+      - wide_spread
+
+  - id: shadow_looser_slippage
+    type: shadow_only
+    source: forward_paper
+    label: shadow_only_do_not_trade
+    max_slippage: 0.05

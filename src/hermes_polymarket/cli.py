@@ -1566,6 +1566,59 @@ def cmd_crypto_paper_campaign_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_strategy_arena_run(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.strategy_arena import load_arena_config, run_strategy_arena, write_arena_artifact
+
+    config = load_arena_config(args.config)
+    result = run_strategy_arena(args.db, config_path=args.config, include_fixture=args.include_fixture)
+    artifact_dir = config.get("arena", {}).get("artifact_dir", "artifacts/strategy_arena")
+    output = write_arena_artifact(result, output=args.output, artifact_dir=artifact_dir)
+    result = {**result, "artifact": str(output)}
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_strategy_arena_report(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.strategy_arena import load_arena_artifact
+
+    path = args.file or "artifacts/strategy_arena/latest.json"
+    print(json.dumps(load_arena_artifact(path), indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_strategy_arena_compare(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.strategy_arena import load_arena_artifact
+
+    path = args.file or "artifacts/strategy_arena/latest.json"
+    result = load_arena_artifact(path)
+    baseline = args.baseline
+    strategies = result.get("strategies", [])
+    baseline_row = next((row for row in strategies if row.get("strategy_id") == baseline), {"net_pnl": 0.0, "positions": 0, "closed_positions": 0})
+    baseline_pnl = float(baseline_row.get("net_pnl") or 0.0)
+    comparisons = []
+    for row in strategies:
+        if row.get("strategy_id") == baseline:
+            continue
+        comparisons.append(
+            {
+                "strategy_id": row.get("strategy_id"),
+                "baseline": baseline,
+                "net_pnl_delta": float(row.get("net_pnl") or 0.0) - baseline_pnl,
+                "positions_delta": int(row.get("positions") or 0) - int(baseline_row.get("positions") or 0),
+                "closed_positions_delta": int(row.get("closed_positions") or 0) - int(baseline_row.get("closed_positions") or 0),
+                "warnings": row.get("warnings", []),
+            }
+        )
+    print(json.dumps({"mode": "diagnostic_paper", "baseline": baseline, "comparisons": comparisons}, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_strategy_arena_artifacts(args: argparse.Namespace) -> int:
+    path = Path(args.file or "artifacts/strategy_arena/latest.json")
+    print(json.dumps({"mode": "diagnostic_paper", "artifact": str(path), "exists": path.exists()}, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_l2_recorder_start(args: argparse.Namespace) -> int:
     from hermes_polymarket.crypto.l2_recorder import run_l2_recorder
     from hermes_polymarket.data_sources.base import DataEvent, EventType, now_ms
@@ -2059,6 +2112,25 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_campaign_summary.add_argument("--include-fixture", action="store_true")
     crypto_paper_campaign_summary.add_argument("--include-signals", action="store_true")
     crypto_paper_campaign_summary.set_defaults(func=cmd_crypto_paper_campaign_summary)
+
+    strategy_arena = sub.add_parser("strategy-arena")
+    strategy_arena_sub = strategy_arena.add_subparsers(dest="strategy_arena_command", required=True)
+    strategy_arena_run = strategy_arena_sub.add_parser("run")
+    strategy_arena_run.add_argument("--db", action="append", required=True)
+    strategy_arena_run.add_argument("--config", default="config/strategy_arena.yaml")
+    strategy_arena_run.add_argument("--output", default=None)
+    strategy_arena_run.add_argument("--include-fixture", action="store_true")
+    strategy_arena_run.set_defaults(func=cmd_strategy_arena_run)
+    strategy_arena_report = strategy_arena_sub.add_parser("report")
+    strategy_arena_report.add_argument("--file", default=None)
+    strategy_arena_report.set_defaults(func=cmd_strategy_arena_report)
+    strategy_arena_compare = strategy_arena_sub.add_parser("compare")
+    strategy_arena_compare.add_argument("--baseline", default="no_trade")
+    strategy_arena_compare.add_argument("--file", default=None)
+    strategy_arena_compare.set_defaults(func=cmd_strategy_arena_compare)
+    strategy_arena_artifacts = strategy_arena_sub.add_parser("artifacts")
+    strategy_arena_artifacts.add_argument("--file", default=None)
+    strategy_arena_artifacts.set_defaults(func=cmd_strategy_arena_artifacts)
 
     l2 = sub.add_parser("l2-recorder")
     l2_sub = l2.add_subparsers(dest="l2_command", required=True)
