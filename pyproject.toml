@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-polymarket-clob2-agent"
+version = "0.1.0"
+description = "Safe paper-first Polymarket CLOB V2 agent"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "py-clob-client-v2>=1.0.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.0",
+    "rich>=13.0.0",
+    "pandas>=2.0.0",
+    "sqlalchemy>=2.0.0",
+    "rapidfuzz>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+hermes-polymarket = "hermes_polymarket.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hermes_polymarket"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+

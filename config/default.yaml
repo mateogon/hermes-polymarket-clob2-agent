@@ -1,0 +1,8 @@
+polymarket_host: "https://clob.polymarket.com"
+polygon_chain_id: 137
+mode: "paper"
+database_path: "data/hermes_polymarket.sqlite3"
+initial_bankroll: 1000.0
+allow_live_trading: false
+confidence_discount: 0.5
+

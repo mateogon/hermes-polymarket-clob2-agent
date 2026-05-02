@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.db
+*.sqlite
+*.sqlite3
+data/
+logs/
+external_repos/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads-credential-key
