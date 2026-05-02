@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
+from datetime import datetime, timezone
+from typing import Any
 
 from hermes_polymarket.config import load_settings
 from hermes_polymarket.execution.live_executor import LiveExecutor
@@ -117,22 +122,37 @@ def cmd_wallet_flow_report(args: argparse.Namespace) -> int:
 def cmd_wallet_flow_fetch(args: argparse.Namespace) -> int:
     from hermes_polymarket.data_sources.polymarket_data_api import PolymarketDataApi
     from hermes_polymarket.data_sources.wallet_registry import WalletRegistry
+    from hermes_polymarket.backtest.wallet_replay_storage import insert_wallet_trades
 
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
     registry = WalletRegistry.load()
     wallet = registry.by_name(args.wallet)
     client = PolymarketDataApi()
     try:
         trades = client.get_trades_for_wallet(wallet.address, limit=args.limit, min_cash=args.min_cash)
-        print(json.dumps({"wallet": wallet.name, "address": wallet.address, "trades": [trade.raw for trade in trades]}, indent=2, sort_keys=True))
+        counts = insert_wallet_trades(db, trades)
+        payload = {
+            "wallet": wallet.name,
+            "address": wallet.address,
+            "fetched_count": counts["fetched"],
+            "inserted_count": counts["inserted"],
+            "duplicate_count": counts["duplicates"],
+        }
+        if args.json:
+            payload["trades"] = [trade.raw for trade in trades]
+        print(json.dumps(payload, indent=2, sort_keys=True))
     finally:
         client.close()
+        db.close()
     return 0
 
 
 def cmd_wallet_flow_replay(args: argparse.Namespace) -> int:
     from hermes_polymarket.backtest.wallet_replay import replay_wallet_trades
-    from hermes_polymarket.backtest.wallet_replay_models import ReplayRunConfig
-    from hermes_polymarket.backtest.wallet_replay_storage import insert_replay_run, insert_replay_trade
+    from hermes_polymarket.backtest.wallet_replay_models import ExitModel, ReplayRunConfig
+    from hermes_polymarket.backtest.wallet_replay_storage import insert_replay_run, insert_replay_trade, wallet_trades
     from hermes_polymarket.data_sources.wallet_registry import WalletRegistry
 
     settings = _settings()
@@ -141,8 +161,18 @@ def cmd_wallet_flow_replay(args: argparse.Namespace) -> int:
     try:
         wallet = WalletRegistry.load().by_name(args.wallet)
         delays = tuple(int(value) for value in args.delay.split(",") if value.strip())
-        config = ReplayRunConfig(wallet=wallet.address, delays_seconds=delays, mode=args.mode.replace("-", "_"), paper_amount_usd=args.amount)
-        run_id, results, summary = replay_wallet_trades([], config)
+        trades = wallet_trades(db, wallet.address, limit=args.limit, since_ts=args.since_ts, condition_id=args.condition_id)
+        if not trades:
+            print("No persisted wallet trades. Run wallet-flow fetch first.")
+            return 2
+        config = ReplayRunConfig(
+            wallet=wallet.address,
+            delays_seconds=delays,
+            mode=args.mode.replace("-", "_"),
+            paper_amount_usd=args.amount,
+            exit_model=ExitModel(args.exit_model),
+        )
+        run_id, results, summary = replay_wallet_trades(trades, config)
         insert_replay_run(
             db,
             run_id=run_id,
@@ -150,11 +180,14 @@ def cmd_wallet_flow_replay(args: argparse.Namespace) -> int:
             mode=config.mode,
             data_quality=config.data_quality,
             delays=list(config.delays_seconds),
-            config={"wallet_name": wallet.name, "amount": args.amount},
+            config={"wallet_name": wallet.name, "amount": args.amount, "exit_model": config.exit_model.value, "limit": args.limit},
             metrics=summary,
         )
         for result in results:
             insert_replay_trade(db, result.to_storage_dict())
+        artifact_paths = _write_replay_artifacts(run_id, wallet.name, config, summary, results)
+        _record_replay_experiment(db, run_id, wallet.name, wallet.address, config, summary, artifact_paths)
+        _maybe_create_replay_memory(db, run_id, wallet.address, wallet.name, summary)
         print(json.dumps({"run_id": run_id, "wallet": wallet.name, "summary": summary}, indent=2, sort_keys=True))
     finally:
         db.close()
@@ -163,7 +196,7 @@ def cmd_wallet_flow_replay(args: argparse.Namespace) -> int:
 
 def cmd_wallet_flow_score(args: argparse.Namespace) -> int:
     from hermes_polymarket.backtest.wallet_replay_models import ExitModel, ReplayTradeResult
-    from hermes_polymarket.backtest.wallet_replay_storage import replay_trades
+    from hermes_polymarket.backtest.wallet_replay_storage import replay_trades, upsert_wallet_score
     from hermes_polymarket.data_sources.wallet_registry import WalletRegistry
     from hermes_polymarket.signals.wallet_score import score_wallet
 
@@ -194,24 +227,174 @@ def cmd_wallet_flow_score(args: argparse.Namespace) -> int:
             if row["wallet"].lower() == wallet.address.lower()
         ]
         score = score_wallet(wallet.address, results)
-        print(json.dumps({"wallet": wallet.name, "score": score.score, "components": score.components, "sample_size": score.sample_size}, indent=2, sort_keys=True))
+        upsert_wallet_score(
+            db,
+            wallet=wallet.address,
+            score=score.score,
+            components=score.components,
+            sample_size=score.sample_size,
+            warnings=list(score.warnings),
+        )
+        print(
+            json.dumps(
+                {
+                    "wallet": wallet.name,
+                    "address": wallet.address,
+                    "score": score.score,
+                    "components": score.components,
+                    "sample_size": score.sample_size,
+                    "warnings": list(score.warnings),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
     finally:
         db.close()
     return 0
 
 
 def cmd_wallet_flow_leaderboard(_: argparse.Namespace) -> int:
-    from hermes_polymarket.backtest.wallet_replay_storage import replay_trades
+    from hermes_polymarket.backtest.wallet_replay_storage import wallet_scores
 
     settings = _settings()
     db = Database(settings.database_path)
     db.init_schema(settings.initial_bankroll)
     try:
-        wallets = sorted({row["wallet"] for row in replay_trades(db)})
-        print(json.dumps({"wallets": wallets}, indent=2, sort_keys=True))
+        rows = [
+            {
+                "wallet": row["wallet"],
+                "score": row["score"],
+                "sample_size": row["sample_size"],
+                "warnings": json.loads(row["warnings_json"] or "[]"),
+                "components": json.loads(row["components_json"] or "{}"),
+            }
+            for row in wallet_scores(db)
+        ]
+        print(json.dumps({"wallets": rows}, indent=2, sort_keys=True))
     finally:
         db.close()
     return 0
+
+
+def _git_commit_sha() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True).strip()
+    except Exception:
+        return "unknown"
+
+
+def _stable_hash(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, sort_keys=True, default=str).encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _write_replay_artifacts(run_id: str, wallet_name: str, config: object, summary: dict[str, Any], results: list[object]) -> dict[str, str]:
+    artifact_base = Path(os.getenv("HERMES_ARTIFACTS_DIR", str(Path(__file__).resolve().parents[2] / "artifacts" / "runs")))
+    root = artifact_base / run_id
+    root.mkdir(parents=True, exist_ok=True)
+    config_payload = {
+        "wallet_name": wallet_name,
+        "wallet": config.wallet,
+        "mode": config.mode,
+        "data_quality": config.data_quality,
+        "delays_seconds": list(config.delays_seconds),
+        "paper_amount_usd": config.paper_amount_usd,
+        "exit_model": config.exit_model.value,
+    }
+    paths = {
+        "config": str(root / "config.json"),
+        "summary": str(root / "summary.json"),
+        "replay_trades": str(root / "replay_trades.jsonl"),
+        "notes": str(root / "notes.md"),
+    }
+    Path(paths["config"]).write_text(json.dumps(config_payload, indent=2, sort_keys=True) + "\n")
+    Path(paths["summary"]).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    Path(paths["replay_trades"]).write_text("\n".join(json.dumps(result.to_storage_dict(), sort_keys=True) for result in results) + "\n")
+    Path(paths["notes"]).write_text(
+        "# Wallet Replay Notes\n\n"
+        f"- Run: `{run_id}`\n"
+        f"- Data quality: `{config.data_quality}`\n"
+        "- Historical approximate mode uses public wallet trades, not executable L2 orderbook snapshots.\n"
+        "- Candidate memories remain inactive until explicitly promoted to paper.\n"
+    )
+    return paths
+
+
+def _record_replay_experiment(
+    db: Database,
+    run_id: str,
+    wallet_name: str,
+    wallet_address: str,
+    config: object,
+    summary: dict[str, Any],
+    artifact_paths: dict[str, str],
+) -> None:
+    from hermes_polymarket.learning.experiments import ExperimentTracker
+    from hermes_polymarket.learning.journal_schema import StrategyExperimentRecord
+
+    parameters = {
+        "wallet": wallet_address,
+        "wallet_name": wallet_name,
+        "mode": config.mode,
+        "delays_seconds": list(config.delays_seconds),
+        "paper_amount_usd": config.paper_amount_usd,
+        "max_worse_entry_cents": config.max_worse_entry_cents,
+        "max_delay_seconds": config.max_delay_seconds,
+        "exit_model": config.exit_model.value,
+    }
+    now = datetime.now(timezone.utc).isoformat()
+    ExperimentTracker(db).record(
+        StrategyExperimentRecord(
+            run_id=run_id,
+            run_type="wallet_replay",
+            strategy_id=f"wallet_flow:{wallet_name}",
+            code_commit_sha=_git_commit_sha(),
+            config_hash=_stable_hash(parameters),
+            data_quality=config.data_quality,
+            parameters=parameters,
+            metrics=summary,
+            artifacts={"run_id": run_id, "wallet": wallet_address, "mode": config.mode, "delays": list(config.delays_seconds), "paths": artifact_paths},
+            dataset_version=f"wallet_observed_trades:{wallet_address}",
+            started_at=now,
+            ended_at=now,
+        )
+    )
+
+
+def _maybe_create_replay_memory(db: Database, run_id: str, wallet_address: str, wallet_name: str, summary: dict[str, Any]) -> None:
+    from hermes_polymarket.learning.memory_store import MemoryRecord, MemoryStore
+
+    closed = int(summary.get("replayed_trades") or 0)
+    skipped = sum(int(value) for value in (summary.get("skipped_trades_by_reason") or {}).values())
+    pending = int(summary.get("pending_trades") or 0)
+    if closed < 3 and skipped < 3 and pending < 3:
+        return
+    memory_id = f"memory:{run_id}:wallet_copyability"
+    content = {
+        "rule_type": "wallet_copyability_warning",
+        "wallet": wallet_name,
+        "statement": "Wallet replay produced candidate copyability evidence; keep inactive until reviewed.",
+        "data_quality": summary.get("data_quality"),
+        "closed_trades": closed,
+        "pending_trades": pending,
+        "skipped_trades_by_reason": summary.get("skipped_trades_by_reason", {}),
+        "by_delay": summary.get("by_delay", {}),
+    }
+    MemoryStore(db).put(
+        MemoryRecord(
+            memory_id=memory_id,
+            memory_type="semantic",
+            status="candidate_rule",
+            strategy_id=f"wallet_flow:{wallet_name}",
+            wallet=wallet_address,
+            content=content,
+            evidence={"run_id": run_id, "summary": summary},
+            confidence=0.35,
+            active_in_paper=False,
+            active_in_live=False,
+        )
+    )
 
 
 def _learning_db() -> tuple[Database, object]:
@@ -336,12 +519,17 @@ def build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("--wallet", required=True)
     fetch.add_argument("--limit", type=int, default=100)
     fetch.add_argument("--min-cash", type=float, default=None)
+    fetch.add_argument("--json", action="store_true", help="Include raw Data API trade payloads in output")
     fetch.set_defaults(func=cmd_wallet_flow_fetch)
     replay = wallet_sub.add_parser("replay")
     replay.add_argument("--wallet", required=True)
     replay.add_argument("--delay", default="0,2,5,15,30,120,600")
     replay.add_argument("--mode", default="historical-approx", choices=["historical-approx", "local-l2"])
     replay.add_argument("--amount", type=float, default=5.0)
+    replay.add_argument("--limit", type=int, default=1000)
+    replay.add_argument("--since-ts", type=int, default=None)
+    replay.add_argument("--condition-id", default=None)
+    replay.add_argument("--exit-model", default="leader_exit", choices=["leader_exit", "resolution_exit", "risk_exit"])
     replay.set_defaults(func=cmd_wallet_flow_replay)
     score = wallet_sub.add_parser("score")
     score.add_argument("--wallet", required=True)

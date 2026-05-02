@@ -24,6 +24,7 @@ class Database:
 
     def init_schema(self, starting_balance: float) -> None:
         self.conn.executescript(SCHEMA)
+        self._run_lightweight_migrations()
         row = self.conn.execute("SELECT id FROM account WHERE id = 1").fetchone()
         if row is None:
             self.conn.execute(
@@ -31,6 +32,11 @@ class Database:
                 (starting_balance, starting_balance),
             )
         self.conn.commit()
+
+    def _run_lightweight_migrations(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(wallet_scores)")}
+        if columns and "warnings_json" not in columns:
+            self.conn.execute("ALTER TABLE wallet_scores ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'")
 
     def account(self) -> sqlite3.Row:
         row = self.conn.execute("SELECT * FROM account WHERE id = 1").fetchone()

@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 from collections import Counter, defaultdict
 
-from hermes_polymarket.backtest.exit_models import leader_exit, pnl_for_exit
+from hermes_polymarket.backtest.exit_models import ExitResult, leader_exit, pnl_for_exit
 from hermes_polymarket.backtest.wallet_replay_models import ExitModel, ReplayRunConfig, ReplayTradeResult
 from hermes_polymarket.data_sources.polymarket_data_api import WalletTrade
 
@@ -50,7 +50,7 @@ def _replay_entry(
     if worse > config.max_worse_entry_cents:
         return _skipped(replay_id, run_id, entry, config, delay, category, "entry_too_late_or_too_expensive", delayed_price, worse)
 
-    exit_result = leader_exit(entry, trades)
+    exit_result = _exit_for_entry(entry, trades, config)
     if exit_result.status != "closed" or exit_result.exit_price is None:
         return ReplayTradeResult(
             replay_trade_id=replay_id,
@@ -92,6 +92,20 @@ def _replay_entry(
         category=category,
         payload={"data_quality": config.data_quality, "exit_reason": exit_result.reason},
     )
+
+
+def _exit_for_entry(entry: WalletTrade, trades: list[WalletTrade], config: ReplayRunConfig) -> ExitResult:
+    if config.exit_model == ExitModel.LEADER_EXIT:
+        return leader_exit(entry, trades)
+    if config.exit_model == ExitModel.RESOLUTION_EXIT:
+        # Historical replay does not have trusted resolution data yet. Keep this
+        # explicit so reports do not imply resolution PnL was computed.
+        return ExitResult(ExitModel.RESOLUTION_EXIT, "pending", reason="resolution_data_missing")
+    if config.exit_model == ExitModel.RISK_EXIT:
+        # Risk exit requires a local L2/price path. Data API trades alone are
+        # not a reliable path for TP/SL/timeout replay.
+        return ExitResult(ExitModel.RISK_EXIT, "pending", reason="price_path_missing")
+    raise ValueError(f"Unsupported exit model: {config.exit_model}")
 
 
 def _price_at_or_after(trades: list[WalletTrade], entry: WalletTrade, ts: int) -> float | None:
@@ -168,6 +182,11 @@ def summarize_replay(results: list[ReplayTradeResult], data_quality: str) -> dic
         }
     return {
         "data_quality": data_quality,
+        "data_quality_notes": [
+            "entry prices are approximated from public wallet trades, not L2 orderbook",
+            "slippage is not reliable until local_l2 mode",
+            "PnL is only meaningful for leader_exit when sell observed",
+        ],
         "observed_trades": len(results),
         "replayed_trades": sum(1 for row in results if row.status == "closed"),
         "pending_trades": pending,

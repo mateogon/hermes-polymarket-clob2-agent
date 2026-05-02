@@ -87,4 +87,4 @@ class WalletScore:
     score: float
     components: dict[str, float]
     sample_size: int
-
+    warnings: tuple[str, ...] = ()

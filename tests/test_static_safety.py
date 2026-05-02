@@ -34,3 +34,16 @@ def test_dry_run_script_has_no_private_or_posting_path():
     assert "private_client_state" not in text
     assert "create_and_post" not in text
     assert "post_order" not in text
+
+
+def test_learning_and_wallet_research_do_not_import_live_executor():
+    checked = [
+        ROOT / "src/hermes_polymarket/learning",
+        ROOT / "src/hermes_polymarket/backtest",
+        ROOT / "src/hermes_polymarket/signals/wallet_flow_signal.py",
+        ROOT / "src/hermes_polymarket/signals/wallet_score.py",
+    ]
+    for path in checked:
+        files = path.rglob("*.py") if path.is_dir() else [path]
+        for file in files:
+            assert "live_executor" not in file.read_text()

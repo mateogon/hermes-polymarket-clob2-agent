@@ -9,6 +9,9 @@ from hermes_polymarket.backtest.wallet_replay_models import ReplayTradeResult, W
 
 def score_wallet(wallet: str, results: list[ReplayTradeResult]) -> WalletScore:
     closed = [row for row in results if row.status == "closed"]
+    warnings: list[str] = []
+    if len(closed) < 30:
+        warnings.append("small_sample")
     components = {
         "sample_size": _sample_size_score(len(closed)),
         "recent_performance": _recent_performance_score(closed),
@@ -25,7 +28,7 @@ def score_wallet(wallet: str, results: list[ReplayTradeResult]) -> WalletScore:
     penalty_keys = ["style_drift", "one_hit_wonder", "market_liquidity"]
     score = sum(components[key] for key in positive_keys) / len(positive_keys)
     score -= sum(components[key] for key in penalty_keys) / len(penalty_keys) * 0.35
-    return WalletScore(wallet=wallet, score=max(0.0, min(1.0, score)), components=components, sample_size=len(closed))
+    return WalletScore(wallet=wallet, score=max(0.0, min(1.0, score)), components=components, sample_size=len(closed), warnings=tuple(warnings))
 
 
 def _sample_size_score(n: int) -> float:

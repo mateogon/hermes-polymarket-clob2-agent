@@ -1,5 +1,5 @@
 from hermes_polymarket.backtest.wallet_replay import replay_wallet_trades
-from hermes_polymarket.backtest.wallet_replay_models import ReplayRunConfig
+from hermes_polymarket.backtest.wallet_replay_models import ExitModel, ReplayRunConfig
 from hermes_polymarket.data_sources.polymarket_data_api import WalletTrade
 
 
@@ -51,3 +51,24 @@ def test_wallet_replay_marks_unresolved_without_leader_exit_pending():
     _, results, summary = replay_wallet_trades([trade("BUY", 100, 0.5)], config, run_id="run")
     assert results[0].status == "pending"
     assert summary["pending_trades"] == 1
+
+
+def test_wallet_replay_resolution_exit_without_resolution_data_is_pending():
+    config = ReplayRunConfig(wallet=WALLET, delays_seconds=(0,), exit_model=ExitModel.RESOLUTION_EXIT)
+    _, results, _ = replay_wallet_trades([trade("BUY", 100, 0.5), trade("SELL", 200, 0.7)], config, run_id="run")
+    assert results[0].status == "pending"
+    assert results[0].payload["pending_reason"] == "resolution_data_missing"
+
+
+def test_wallet_replay_risk_exit_without_price_path_is_pending():
+    config = ReplayRunConfig(wallet=WALLET, delays_seconds=(0,), exit_model=ExitModel.RISK_EXIT)
+    _, results, _ = replay_wallet_trades([trade("BUY", 100, 0.5), trade("SELL", 200, 0.7)], config, run_id="run")
+    assert results[0].status == "pending"
+    assert results[0].payload["pending_reason"] == "price_path_missing"
+
+
+def test_wallet_replay_summary_labels_historical_approx_limits():
+    config = ReplayRunConfig(wallet=WALLET, delays_seconds=(0,))
+    _, _, summary = replay_wallet_trades([trade("BUY", 100, 0.5), trade("SELL", 200, 0.7)], config, run_id="run")
+    assert summary["data_quality"] == "historical_approx"
+    assert any("not L2 orderbook" in note for note in summary["data_quality_notes"])

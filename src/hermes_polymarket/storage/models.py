@@ -199,9 +199,28 @@ CREATE TABLE IF NOT EXISTS wallet_replay_trades (
   payload_json TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS wallet_observed_trades (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  wallet TEXT NOT NULL,
+  condition_id TEXT NOT NULL,
+  asset_id TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  side TEXT NOT NULL,
+  price REAL NOT NULL,
+  size REAL NOT NULL,
+  timestamp INTEGER NOT NULL,
+  slug TEXT,
+  title TEXT,
+  tx_hash TEXT,
+  raw_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(wallet, tx_hash, condition_id, asset_id, side, timestamp)
+);
+
 CREATE TABLE IF NOT EXISTS wallet_scores (
   wallet TEXT PRIMARY KEY,
   score REAL NOT NULL,
+  warnings_json TEXT NOT NULL DEFAULT '[]',
   components_json TEXT NOT NULL,
   sample_size INTEGER NOT NULL,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP

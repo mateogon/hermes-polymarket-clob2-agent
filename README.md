@@ -2,7 +2,7 @@
 
 Local project workspace for a safe Polymarket CLOB V2 trading agent.
 
-Current stage: safe paper-first scaffold plus public-data intelligence layer.
+Current stage: safe paper-first scaffold plus public-data intelligence layer, learning loop, and historical-approx wallet replay.
 
 Created artifacts:
 
@@ -58,12 +58,21 @@ Wallet replay commands:
 
 ```bash
 .venv/bin/python -m hermes_polymarket.cli wallet-flow fetch --wallet coinman2 --limit 100
-.venv/bin/python -m hermes_polymarket.cli wallet-flow replay --wallet coinman2 --delay 0,2,5,15,30,120,600 --mode historical-approx
+.venv/bin/python -m hermes_polymarket.cli wallet-flow replay --wallet coinman2 --delay 0,2,5,15,30,120,600 --mode historical-approx --exit-model leader_exit
 .venv/bin/python -m hermes_polymarket.cli wallet-flow score --wallet coinman2
 .venv/bin/python -m hermes_polymarket.cli wallet-flow leaderboard
 ```
 
-Replay output is labeled `historical_approx` unless backed by locally recorded L2 snapshots.
+Replay now reads persisted wallet trades from SQLite. Run `wallet-flow fetch` first; replay refuses clearly if there are no stored trades for that wallet. Output is labeled `historical_approx` unless backed by locally recorded L2 snapshots. In this mode, entry prices are approximated from public wallet trades, not executable L2 orderbooks, so slippage is not reliable yet.
+
+Each replay also writes:
+
+- `wallet_replay_runs` and `wallet_replay_trades`
+- a `strategy_experiments` row
+- inactive candidate memories when enough evidence exists
+- artifacts under `artifacts/runs/<run_id>/`
+
+`resolution_exit` and `risk_exit` are intentionally honest placeholders in historical-approx mode: they return pending reasons until resolution data or local price paths are available.
 
 Live gate check, expected to refuse by default:
 
