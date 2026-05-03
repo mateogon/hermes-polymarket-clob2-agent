@@ -423,6 +423,52 @@ def test_universe_strike_events_lists_candidate_events(monkeypatch, capsys):
     assert payload["events"][0]["candidate_count"] == 2
 
 
+def test_universe_multi_strike_candidates_reports_research_only(monkeypatch, capsys):
+    class FakeGamma:
+        def list_events(self, **_kwargs):
+            return [
+                {
+                    "slug": "when-will-bitcoin-hit-150k",
+                    "title": "When will Bitcoin hit 150k?",
+                    "markets": [
+                        _market(
+                            conditionId="hit-150",
+                            question="Will Bitcoin hit $150k by June 30, 2026?",
+                            slug="will-bitcoin-hit-150k-by-june-30-2026",
+                            outcomes='["Yes", "No"]',
+                            clobTokenIds='["yes-token", "no-token"]',
+                            endDate="2026-07-01T04:00:00Z",
+                        )
+                    ],
+                }
+            ]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermes_polymarket.polymarket.gamma_client.GammaClient", FakeGamma)
+    monkeypatch.setattr("hermes_polymarket.crypto.watchlist_seeding.current_reference_consensus", lambda _symbol: (100000.0, ("binance", "coinbase"), 0.01))
+
+    assert main(
+        [
+            "crypto-latency",
+            "universe",
+            "multi-strike-candidates",
+            "--event-slug",
+            "when-will-bitcoin-hit-150k",
+            "--symbol",
+            "btcusdt",
+            "--limit",
+            "5",
+        ]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["data_quality"] == "multi_strike_research_only"
+    assert payload["candidates"][0]["target_price"] == 150000.0
+    assert payload["candidates"][0]["fair_value"]["reason"] == "barrier_touch_diffusion_approx"
+    assert "multi_strike_long_dated_research_only" in payload["candidates"][0]["selection_reasons"]
+
+
 def test_availability_monitor_reports_waiting_for_venue(monkeypatch, tmp_path, capsys):
     class FakeGamma:
         def list_events(self, **_kwargs):
@@ -473,7 +519,7 @@ def test_availability_monitor_reports_waiting_for_venue(monkeypatch, tmp_path, c
     payload = json.loads(capsys.readouterr().out)
     assert payload["checks"] == 1
     assert payload["availability"]["btcusdt"]["strike_healthy_checks"] == 0
-    assert payload["availability"]["btcusdt"]["recommendation"] == "waiting_for_healthy_venue"
+    assert payload["availability"]["btcusdt"]["recommendation"] == "evaluate_multi_strike_research_only"
     assert output.exists()
 
 

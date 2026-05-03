@@ -1074,6 +1074,144 @@ def cmd_crypto_latency_universe(args: argparse.Namespace) -> int:
             gamma.close()
         return 0
 
+    if args.universe_action == "multi-strike-candidates":
+        if not args.symbol:
+            print("multi-strike-candidates requires --symbol")
+            return 2
+        from hermes_polymarket.crypto.multi_strike_fair_value import fair_value_target_hit
+        from hermes_polymarket.crypto.multi_strike_market import parse_multi_strike_target
+
+        gamma = GammaClient()
+        try:
+            events = gamma.list_events(slug=args.event_slug, active="true", closed="false", limit=5)
+            if not events:
+                print(json.dumps({"status": "event_not_found", "event_slug": args.event_slug}, indent=2, sort_keys=True))
+                return 2
+            event = events[0]
+            payload = scan_market_universe(events=[event], markets=[], symbols={args.symbol})
+            price, sources, max_dev = current_reference_consensus(args.symbol)
+            now = datetime.now(timezone.utc)
+            candidates: list[dict[str, Any]] = []
+            for row in filter_universe_candidates(payload, market_type="multi_strike_event", min_score=0.0, limit=500):
+                if not row.get("active") or row.get("closed"):
+                    continue
+                target = parse_multi_strike_target(f"{row.get('question') or ''} {row.get('slug') or ''}", current_price=price)
+                target_price = row.get("strike_price") or (target.target_price if target is not None else None)
+                if target_price is None:
+                    continue
+                seconds_to_expiry = 1.0
+                if row.get("end_date"):
+                    with contextlib.suppress(ValueError):
+                        parsed = datetime.fromisoformat(str(row["end_date"]).replace("Z", "+00:00"))
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        seconds_to_expiry = max(1.0, (parsed - now).total_seconds())
+                fv = fair_value_target_hit(
+                    current_price=price,
+                    target_price=float(target_price),
+                    seconds_to_expiry=seconds_to_expiry,
+                    annualized_vol=args.annualized_vol,
+                )
+                distance_abs = abs(float(fv.distance_pct))
+                market_score = float(row.get("score") or 0.0)
+                recommended = market_score >= args.min_score and args.min_distance_pct <= distance_abs <= args.max_distance_pct
+                candidates.append(
+                    {
+                        **row,
+                        "current_price": price,
+                        "target_price": float(target_price),
+                        "target_direction": fv.direction,
+                        "distance_pct": fv.distance_pct,
+                        "market_score": market_score,
+                        "fair_value": fv.to_dict(),
+                        "rest_book_ok": None,
+                        "l2_quality": None,
+                        "recommended": recommended,
+                        "selection_reasons": [
+                            *([] if recommended else ["outside_distance_or_score_gate"]),
+                            "score_l2_not_run" if getattr(args, "score_l2", False) else "universe_score_only",
+                            "multi_strike_long_dated_research_only",
+                        ],
+                    }
+                )
+            candidates.sort(key=lambda row: abs(float(row["distance_pct"])))
+            candidates = candidates[: args.limit]
+            if args.score_l2 and candidates:
+                from hermes_polymarket.crypto.market_quality import evaluate_market_quality
+
+                settings = _settings()
+                client = ClobV2Client(settings)
+                try:
+                    for candidate in candidates:
+                        token_quality: dict[str, Any] = {}
+                        rest_ok = True
+                        allowed = True
+                        quality_reasons: list[str] = []
+                        for outcome, token_id in (("YES", candidate.get("yes_token_id")), ("NO", candidate.get("no_token_id"))):
+                            if not token_id:
+                                rest_ok = False
+                                allowed = False
+                                token_quality[outcome] = {"allowed": False, "reason": "missing_token_id"}
+                                quality_reasons.append("missing_token_id")
+                                continue
+                            try:
+                                book = client.get_orderbook(str(token_id))
+                                quality = evaluate_market_quality(book).to_dict()
+                                best_ask = book.best_ask
+                                probability_yes = float(candidate["fair_value"]["probability_yes"])
+                                edge = probability_yes - best_ask if outcome == "YES" and best_ask is not None else (1.0 - probability_yes) - best_ask if best_ask is not None else None
+                                token_quality[outcome] = {
+                                    "token_id": str(token_id),
+                                    "best_bid": book.best_bid,
+                                    "best_ask": best_ask,
+                                    "fair_value_edge": edge,
+                                    "quality": quality,
+                                }
+                                if not quality.get("allowed"):
+                                    allowed = False
+                                    quality_reasons.append(str(quality.get("reason") or "quality_rejected"))
+                            except Exception as exc:  # noqa: BLE001 - candidate scoring reports per-token failures.
+                                rest_ok = False
+                                allowed = False
+                                reason = str(exc)
+                                token_quality[outcome] = {"token_id": str(token_id), "allowed": False, "reason": reason}
+                                quality_reasons.append(reason)
+                        candidate["rest_book_ok"] = rest_ok
+                        candidate["l2_quality"] = {
+                            "all_allowed": allowed,
+                            "tokens": token_quality,
+                            "reasons": sorted(set(quality_reasons)),
+                        }
+                        candidate["recommended"] = bool(candidate["recommended"] and rest_ok and allowed)
+                        candidate["selection_reasons"] = [
+                            reason for reason in candidate["selection_reasons"] if reason != "score_l2_not_run"
+                        ]
+                        candidate["selection_reasons"].append("l2_quality_ok" if rest_ok and allowed else "l2_quality_rejected")
+                finally:
+                    client.close()
+            print(
+                json.dumps(
+                    {
+                        "mode": "measurement_paper_only",
+                        "event_slug": args.event_slug,
+                        "symbol": args.symbol,
+                        "data_quality": "multi_strike_research_only",
+                        "current_price": price,
+                        "current_price_source": args.current_price_source,
+                        "consensus_sources": list(sources),
+                        "max_deviation_pct": max_dev,
+                        "annualized_vol": args.annualized_vol,
+                        "candidates": candidates,
+                        "recommendation": "research_only_do_not_run_watch_v2_without_multi_strike_strategy",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        finally:
+            gamma.close()
+        return 0
+
     if args.universe_action == "import-best":
         if args.market_type != "up_down":
             print(json.dumps({"status": "unsupported_market_type", "reason": "import-best currently supports up_down only"}, indent=2, sort_keys=True))
@@ -1359,6 +1497,8 @@ def cmd_crypto_latency_availability_monitor(args: argparse.Namespace) -> int:
             "recommendation": (
                 "run_v2_when_preflight_passes"
                 if int(row["strike_healthy_checks"]) > 0 or int(row["up_down_healthy_checks"]) > 0
+                else "evaluate_multi_strike_research_only"
+                if int(row["multi_strike_checks"]) > 0
                 else "waiting_for_healthy_venue"
             ),
         }
@@ -1374,7 +1514,7 @@ def cmd_crypto_latency_availability_monitor(args: argparse.Namespace) -> int:
         "min_score": args.min_score,
         "availability": availability,
         "latest_check": checks[-1] if checks else None,
-        "recommendation": "Run v2 only when strike_healthy_checks or up_down_healthy_checks is greater than 0.",
+        "recommendation": "Run v2 only when strike_healthy_checks or up_down_healthy_checks is greater than 0; evaluate multi_strike_event separately.",
     }
     if args.output:
         output_path = Path(args.output)
@@ -3042,6 +3182,17 @@ def build_parser() -> argparse.ArgumentParser:
     universe_strike_events.add_argument("--min-score", type=float, default=0.75)
     universe_strike_events.add_argument("--limit", type=int, default=20)
     universe_strike_events.set_defaults(func=cmd_crypto_latency_universe)
+    universe_multi_strike = universe_sub.add_parser("multi-strike-candidates")
+    universe_multi_strike.add_argument("--event-slug", required=True)
+    universe_multi_strike.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    universe_multi_strike.add_argument("--limit", type=int, default=20)
+    universe_multi_strike.add_argument("--min-score", type=float, default=0.75)
+    universe_multi_strike.add_argument("--min-distance-pct", type=float, default=2.0)
+    universe_multi_strike.add_argument("--max-distance-pct", type=float, default=200.0)
+    universe_multi_strike.add_argument("--annualized-vol", type=float, default=0.80)
+    universe_multi_strike.add_argument("--score-l2", action="store_true")
+    universe_multi_strike.add_argument("--current-price-source", choices=["consensus"], default="consensus")
+    universe_multi_strike.set_defaults(func=cmd_crypto_latency_universe)
     universe_import_best = universe_sub.add_parser("import-best")
     universe_import_best.add_argument("--file", default="artifacts/universe/latest.json")
     universe_import_best.add_argument("--market-type", choices=["up_down", "above_strike", "below_strike", "multi_strike_event", "unsupported"], default="up_down")

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_polymarket.crypto.crypto_market_classifier import infer_symbol_from_text
+from hermes_polymarket.crypto.multi_strike_market import parse_multi_strike_target
 from hermes_polymarket.crypto.strike_market import parse_strike_market
 from hermes_polymarket.crypto.updown_discovery import UPDOWN_PATTERNS
 from hermes_polymarket.data_sources.base import now_ms
@@ -212,6 +213,9 @@ def build_candidate(
     strike = parse_strike_market(text)
     if strike is not None:
         market_type = strike.market_type
+    target = parse_multi_strike_target(text)
+    if strike is None and target is not None:
+        market_type = target.market_type
     outcomes = _outcomes(market)
     token_ids = _token_ids(market)
     active = bool(market.get("active", False))
@@ -280,8 +284,8 @@ def build_candidate(
         no_token_id=no_token_id,
         up_token_id=up_token_id,
         down_token_id=down_token_id,
-        strike_price=strike.strike_price if strike is not None else None,
-        comparator=strike.comparator if strike is not None else None,
+        strike_price=strike.strike_price if strike is not None else target.target_price if target is not None else None,
+        comparator=strike.comparator if strike is not None else target.target_direction if target is not None else None,
         outcomes=outcomes,
         end_date=str(market.get("endDate") or "") or None,
         active=active,
