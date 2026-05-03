@@ -6,6 +6,7 @@ from hermes_polymarket.crypto.market_universe import (
     filter_universe_candidates,
     scan_market_universe,
 )
+from hermes_polymarket.polymarket.types import OrderBook, OrderBookLevel
 from hermes_polymarket.signals.source_consensus import ConsensusPrice
 
 
@@ -99,3 +100,68 @@ def test_universe_candidates_cli_reads_artifact(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["count"] == 1
     assert payload["candidates"][0]["slug"] == "a"
+
+
+def test_universe_strike_candidates_accepts_plan_7_26_args(monkeypatch, capsys):
+    class FakeGamma:
+        def list_events(self, **_kwargs):
+            return [
+                {
+                    "slug": "bitcoin-above-on-may-3",
+                    "title": "Bitcoin above on May 3",
+                    "markets": [
+                        _market(
+                            conditionId="above-78",
+                            question="Will Bitcoin be above $78,000 on May 3?",
+                            slug="bitcoin-above-78k-on-may-3",
+                            outcomes='["Yes", "No"]',
+                            clobTokenIds='["yes-token", "no-token"]',
+                        )
+                    ],
+                }
+            ]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermes_polymarket.polymarket.gamma_client.GammaClient", FakeGamma)
+    monkeypatch.setattr("hermes_polymarket.crypto.watchlist_seeding.current_reference_consensus", lambda _symbol: (78500.0, ("binance", "coinbase"), 0.01))
+
+    class FakeClob:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_orderbook(self, token_id):
+            return OrderBook(
+                token_id=token_id,
+                bids=(OrderBookLevel(0.49, 100.0),),
+                asks=(OrderBookLevel(0.50, 100.0),),
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermes_polymarket.cli.ClobV2Client", FakeClob)
+
+    assert main(
+        [
+            "crypto-latency",
+            "universe",
+            "strike-candidates",
+            "--event-slug",
+            "bitcoin-above-on-may-3",
+            "--symbol",
+            "btcusdt",
+            "--limit",
+            "20",
+            "--score-l2",
+            "--current-price-source",
+            "consensus",
+        ]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["candidates"][0]["slug"] == "bitcoin-above-78k-on-may-3"
+    assert payload["candidates"][0]["market_score"] >= 0.8
+    assert payload["candidates"][0]["rest_book_ok"] is True
+    assert payload["candidates"][0]["l2_quality"]["all_allowed"] is True
+    assert payload["candidates"][0]["recommended"] is True

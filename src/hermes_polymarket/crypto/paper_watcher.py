@@ -76,6 +76,7 @@ class PaperWatcherConfig:
     stale_quote_window_ms: int = 1500
     use_fair_value: bool = False
     fair_value_min_edge: float = 0.03
+    fair_value_annualized_vol: float = 0.60
     min_market_score: float = 0.0
 
 
@@ -146,6 +147,7 @@ def _select_strike_token(
     current_price: float,
     detected_ts_ms: int,
     min_edge: float,
+    annualized_vol: float = 0.60,
 ) -> tuple[DirectionalToken | None, dict[str, Any] | None, str, dict[str, Any]]:
     best: tuple[float, DirectionalToken, dict[str, Any], dict[str, Any]] | None = None
     considered = 0
@@ -165,9 +167,19 @@ def _select_strike_token(
         if seconds_to_expiry <= 0:
             continue
         if comparator == "below":
-            fair = fair_value_below_strike(current_price=current_price, strike_price=float(strike_price), seconds_to_expiry=seconds_to_expiry)
+            fair = fair_value_below_strike(
+                current_price=current_price,
+                strike_price=float(strike_price),
+                seconds_to_expiry=seconds_to_expiry,
+                annualized_vol=annualized_vol,
+            )
         else:
-            fair = fair_value_above_strike(current_price=current_price, strike_price=float(strike_price), seconds_to_expiry=seconds_to_expiry)
+            fair = fair_value_above_strike(
+                current_price=current_price,
+                strike_price=float(strike_price),
+                seconds_to_expiry=seconds_to_expiry,
+                annualized_vol=annualized_vol,
+            )
 
         token_edges: list[tuple[float, str, str, float | None]] = []
         yes_token = str(market.get("yes_token_id") or "")
@@ -181,18 +193,29 @@ def _select_strike_token(
         if not token_edges:
             continue
         edge, token_id, outcome, ask = max(token_edges, key=lambda item: item[0])
+        yes_ask = yes_state.best_ask if yes_state is not None else None
+        no_ask = no_state.best_ask if no_state is not None else None
+        yes_edge = fair.probability_yes - float(yes_ask) if yes_ask is not None else None
+        no_edge = (1.0 - fair.probability_yes) - float(no_ask) if no_ask is not None else None
         payload = {
             "market_type": market.get("market_type"),
             "strike_price": strike_price,
             "comparator": comparator,
             "current_price": current_price,
             "seconds_to_expiry": seconds_to_expiry,
+            "annualized_vol": annualized_vol,
             "probability_yes": fair.probability_yes,
+            "probability_no": 1.0 - fair.probability_yes,
             "distance_pct": fair.distance_pct,
             "selected_side": outcome,
+            "selected_probability": fair.probability_yes if outcome == "YES" else 1.0 - fair.probability_yes,
             "selected_edge": edge,
             "selected_ask": ask,
+            "yes_edge": yes_edge,
+            "no_edge": no_edge,
+            "min_edge": min_edge,
             "fair_value_reason": fair.reason,
+            "fair_value_decision": "allowed" if edge >= min_edge else "edge_below_min",
         }
         if edge >= min_edge:
             selected = DirectionalToken(symbol, str(market.get("condition_id") or ""), token_id, outcome, f"{comparator}_strike")
@@ -205,6 +228,118 @@ def _select_strike_token(
     if considered:
         return None, None, "fair_value_edge_below_min", {"strike_markets_considered": considered}
     return None, None, "no_strike_markets_for_symbol", {}
+
+
+def _v2_signal_diagnostics(
+    *,
+    market: dict[str, Any] | None,
+    strike_payload: dict[str, Any] | None,
+    signal: Any | None,
+    min_edge: float,
+    market_score: dict[str, Any] | None = None,
+    stale: Any | None = None,
+    quality: MarketQualityDecision | None = None,
+) -> dict[str, Any]:
+    strike_payload = strike_payload or {}
+    market_type = str((market or {}).get("market_type") or strike_payload.get("market_type") or "up_down")
+    selected_side = strike_payload.get("selected_side") or (market or {}).get("outcome")
+    probability_yes = strike_payload.get("probability_yes")
+    probability_no = strike_payload.get("probability_no")
+    if probability_no is None and probability_yes is not None:
+        probability_no = 1.0 - float(probability_yes)
+    selected_probability = strike_payload.get("selected_probability")
+    if selected_probability is None and probability_yes is not None:
+        selected_probability = float(probability_yes) if selected_side == "YES" else 1.0 - float(probability_yes)
+    selected_edge = strike_payload.get("selected_edge")
+    decision = strike_payload.get("fair_value_decision")
+    if decision is None:
+        decision = "allowed" if selected_edge is not None and float(selected_edge) >= min_edge else "edge_below_min"
+
+    stale_dict = stale.to_dict() if stale is not None else {}
+    score = market_score or {}
+    return {
+        "strategy_version": "stale_fair_value_v2",
+        "market_type": market_type,
+        "comparator": (market or {}).get("comparator") or strike_payload.get("comparator"),
+        "strike_price": (market or {}).get("strike_price") or strike_payload.get("strike_price"),
+        "current_price": strike_payload.get("current_price") or (getattr(signal, "current_price", None) if signal is not None else None),
+        "reference_price": getattr(signal, "reference_price", None) if signal is not None else None,
+        "seconds_to_expiry": strike_payload.get("seconds_to_expiry"),
+        "annualized_vol": strike_payload.get("annualized_vol"),
+        "fair_value": {
+            "probability_yes": probability_yes,
+            "probability_no": probability_no,
+            "selected_side": selected_side,
+            "selected_probability": selected_probability,
+            "yes_edge": strike_payload.get("yes_edge"),
+            "no_edge": strike_payload.get("no_edge"),
+            "selected_edge": selected_edge,
+            "min_edge": min_edge,
+            "reason": strike_payload.get("fair_value_reason"),
+            "decision": decision,
+        },
+        "stale_quote": {
+            "enabled": stale is not None,
+            "allowed": stale_dict.get("allowed"),
+            "reason": stale_dict.get("reason"),
+            "bbo_change_cents": stale_dict.get("bbo_change_cents"),
+            "max_reprice_cents": None,
+            "stale_window_ms": stale_dict.get("stale_window_ms"),
+        },
+        "market_score": {
+            "score": score.get("score"),
+            "min_required": score.get("min_required"),
+            "decision": score.get("decision"),
+            "reasons": score.get("reasons") or [],
+        },
+        "execution": {
+            "best_bid": quality.best_bid if quality is not None else None,
+            "best_ask": quality.best_ask if quality is not None else None,
+            "avg_fill_price": None,
+            "spread": quality.spread if quality is not None else None,
+            "slippage": None,
+            "depth_within_2pct_usd": quality.depth_within_2pct_usd if quality is not None else None,
+            "depth_within_5pct_usd": quality.depth_within_5pct_usd if quality is not None else None,
+        },
+        "risk": {
+            "allowed": None,
+            "reason": None,
+            "max_slippage": None,
+            "min_edge": min_edge,
+        },
+    }
+
+
+def _merge_v2_diagnostics(payload: dict[str, Any], diagnostics: dict[str, Any] | None) -> dict[str, Any]:
+    if not diagnostics:
+        return payload
+    merged = {**payload, **diagnostics}
+    execution = {**(diagnostics.get("execution") or {})}
+    if payload.get("entry_price") is not None:
+        execution["avg_fill_price"] = payload.get("entry_price")
+    if payload.get("slippage") is not None:
+        execution["slippage"] = payload.get("slippage")
+    if payload.get("best_bid") is not None:
+        execution["best_bid"] = payload.get("best_bid")
+    if payload.get("best_ask") is not None:
+        execution["best_ask"] = payload.get("best_ask")
+    if payload.get("spread") is not None:
+        execution["spread"] = payload.get("spread")
+    risk = {**(diagnostics.get("risk") or {})}
+    risk.update(
+        {
+            "allowed": payload.get("risk_allowed"),
+            "reason": payload.get("risk_reason"),
+            "max_slippage": payload.get("max_slippage"),
+            "min_edge": payload.get("min_edge"),
+        }
+    )
+    for section in ("fair_value", "stale_quote", "market_score"):
+        if isinstance(payload.get(section), dict):
+            merged[section] = {**(diagnostics.get(section) or {}), **payload[section]}
+    merged["execution"] = execution
+    merged["risk"] = risk
+    return merged
 
 
 def _persist_signal_event(
@@ -259,6 +394,7 @@ def _record_token_opportunity(
     settings: Settings,
     open_position_count: int,
     fixture: bool,
+    diagnostics: dict[str, Any] | None = None,
 ) -> tuple[int, int, int, ForwardPaperPosition | None]:
     state = book_state.by_token.get(token_id)
     fill = None
@@ -316,6 +452,38 @@ def _record_token_opportunity(
     midpoint = book.midpoint if book is not None else None
     slippage = fill.slippage if fill is not None else None
 
+    payload = {
+        "mode": "forward_paper_watcher",
+        "threshold_pct": threshold_pct,
+        "external_move_pct": external_move_pct,
+        "selected_direction": direction,
+        "selected_token_id": token_id,
+        "direction_mapping_source": "watchlist",
+        "model_probability_raw": model_probability,
+        "confidence": 0.35,
+        "entry_price": fill.avg_price if fill else None,
+        "condition_id": market.get("condition_id"),
+        "slug": market.get("slug"),
+        "symbol": market.get("symbol"),
+        "direction": direction,
+        "external_move_ts_ms": external_move_ts_ms,
+        "best_bid": state.best_bid if state else None,
+        "best_ask": state.best_ask if state else None,
+        "midpoint": midpoint,
+        "spread": state.spread if state else None,
+        "slippage": slippage,
+        "max_slippage": settings.max_slippage,
+        "min_edge": settings.min_edge,
+        "depth_within_slippage_usd": depth_within_slippage_usd,
+        "fill_status": fill.status if fill else "no_local_book_state",
+        "risk_allowed": risk_allowed,
+        "risk_reason": risk_reason,
+        "risk_explanation": risk_explanation,
+        "source_consensus": source_consensus,
+        "shadow_risk": shadow_risk,
+    }
+    payload = _merge_v2_diagnostics(payload, diagnostics)
+
     row = {
         "opportunity_id": f"paper_opp_{uuid4().hex[:12]}",
         "event_id": event_id,
@@ -329,36 +497,7 @@ def _record_token_opportunity(
         "risk_allowed": risk_allowed,
         "risk_reason": risk_reason,
         "data_quality": "paper_live",
-        "payload": {
-            "mode": "forward_paper_watcher",
-            "threshold_pct": threshold_pct,
-            "external_move_pct": external_move_pct,
-            "selected_direction": direction,
-            "selected_token_id": token_id,
-            "direction_mapping_source": "watchlist",
-            "model_probability_raw": model_probability,
-            "confidence": 0.35,
-            "entry_price": fill.avg_price if fill else None,
-            "condition_id": market.get("condition_id"),
-            "slug": market.get("slug"),
-            "symbol": market.get("symbol"),
-            "direction": direction,
-            "external_move_ts_ms": external_move_ts_ms,
-            "best_bid": state.best_bid if state else None,
-            "best_ask": state.best_ask if state else None,
-            "midpoint": midpoint,
-            "spread": state.spread if state else None,
-            "slippage": slippage,
-            "max_slippage": settings.max_slippage,
-            "min_edge": settings.min_edge,
-            "depth_within_slippage_usd": depth_within_slippage_usd,
-            "fill_status": fill.status if fill else "no_local_book_state",
-            "risk_allowed": risk_allowed,
-            "risk_reason": risk_reason,
-            "risk_explanation": risk_explanation,
-            "source_consensus": source_consensus,
-            "shadow_risk": shadow_risk,
-        },
+        "payload": payload,
     }
     insert_crypto_latency_opportunity(db, row)
     insert_forward_signal(
@@ -384,7 +523,7 @@ def _record_token_opportunity(
             "amount_usd": amount_usd,
             "model_probability": model_probability,
             "fixture": fixture,
-            "payload": row["payload"],
+            "payload": payload,
         },
     )
     signal = ForwardPaperSignal(
@@ -423,8 +562,10 @@ def _record_market_quality_rejection(
     source_consensus: dict[str, Any],
     quality: MarketQualityDecision,
     fixture: bool,
+    diagnostics: dict[str, Any] | None = None,
 ) -> None:
-    payload = {
+    payload = _merge_v2_diagnostics(
+        {
         "mode": "forward_paper_watcher",
         "threshold_pct": threshold_pct,
         "external_move_pct": external_move_pct,
@@ -443,7 +584,9 @@ def _record_market_quality_rejection(
         "risk_explanation": "Market quality gate rejected this token before risk evaluation",
         "source_consensus": source_consensus,
         "market_quality": quality.to_dict(),
-    }
+        },
+        diagnostics,
+    )
     insert_forward_signal(
         db,
         {
@@ -490,8 +633,10 @@ def _record_gate_rejection(
     reason: str,
     gate_payload: dict[str, Any],
     fixture: bool,
+    diagnostics: dict[str, Any] | None = None,
 ) -> None:
-    payload = {
+    payload = _merge_v2_diagnostics(
+        {
         "mode": "forward_paper_watcher",
         "threshold_pct": threshold_pct,
         "external_move_pct": external_move_pct,
@@ -508,7 +653,9 @@ def _record_gate_rejection(
         "risk_reason": reason,
         "source_consensus": source_consensus,
         **gate_payload,
-    }
+        },
+        diagnostics,
+    )
     insert_forward_signal(
         db,
         {
@@ -729,7 +876,9 @@ async def run_crypto_paper_watcher(
             current_price=signal.current_price,
             detected_ts_ms=signal.detected_ts_ms,
             min_edge=config.fair_value_min_edge,
+            annualized_vol=config.fair_value_annualized_vol,
         )
+        diagnostics: dict[str, Any] | None = None
         if selected is None:
             selected = select_directional_token(tokens=directional, symbol=current.symbol, move_pct=signal.external_move_pct)
             market = token_map.get(selected.token_id) if selected else None
@@ -747,6 +896,12 @@ async def run_crypto_paper_watcher(
         )
 
         if selected is None or market is None:
+            diagnostics = _v2_signal_diagnostics(
+                market=market,
+                strike_payload=strike_payload,
+                signal=signal,
+                min_edge=config.fair_value_min_edge,
+            )
             insert_forward_signal(
                 db,
                 {
@@ -765,7 +920,7 @@ async def run_crypto_paper_watcher(
                     "amount_usd": config.amount_usd,
                     "model_probability": config.model_probability,
                     "fixture": config.fixture,
-                    "payload": strike_payload,
+                    "payload": _merge_v2_diagnostics(strike_payload, diagnostics),
                 },
             )
             risk_rejected += 1
@@ -775,6 +930,13 @@ async def run_crypto_paper_watcher(
                 quality = MarketQualityDecision(False, "no_local_book_state", None, None, None, 0.0, 0.0)
             else:
                 quality = evaluate_market_quality(state.as_orderbook())
+            diagnostics = _v2_signal_diagnostics(
+                market=market,
+                strike_payload=strike_payload,
+                signal=signal,
+                min_edge=config.fair_value_min_edge,
+                quality=quality,
+            )
             if not quality.allowed:
                 _record_market_quality_rejection(
                     db,
@@ -791,11 +953,25 @@ async def run_crypto_paper_watcher(
                     source_consensus={"sources": list(current.sources), "max_deviation_pct": current.max_deviation_pct},
                     quality=quality,
                     fixture=config.fixture,
+                    diagnostics=diagnostics,
                 )
                 risk_rejected += 1
                 continue
             if config.min_market_score > 0:
                 market_score = _score_current_market(book_state, market)
+                market_score = {
+                    **market_score,
+                    "min_required": config.min_market_score,
+                    "decision": "allowed" if float(market_score["score"]) >= config.min_market_score else "market_score_below_threshold",
+                }
+                diagnostics = _v2_signal_diagnostics(
+                    market=market,
+                    strike_payload=strike_payload,
+                    signal=signal,
+                    min_edge=config.fair_value_min_edge,
+                    market_score=market_score,
+                    quality=quality,
+                )
                 if float(market_score["score"]) < config.min_market_score:
                     _record_gate_rejection(
                         db,
@@ -812,8 +988,9 @@ async def run_crypto_paper_watcher(
                         source_consensus={"sources": list(current.sources), "max_deviation_pct": current.max_deviation_pct},
                         final_action="market_score_rejected",
                         reason="market_score_below_threshold",
-                        gate_payload={"market_score": {**market_score, "min_required": config.min_market_score}},
+                        gate_payload={"market_score": market_score},
                         fixture=config.fixture,
+                        diagnostics=diagnostics,
                     )
                     risk_rejected += 1
                     continue
@@ -828,6 +1005,16 @@ async def run_crypto_paper_watcher(
                     require_bbo_before=True,
                     require_bbo_after=True,
                 )
+                diagnostics = _v2_signal_diagnostics(
+                    market=market,
+                    strike_payload=strike_payload,
+                    signal=signal,
+                    min_edge=config.fair_value_min_edge,
+                    market_score=(diagnostics or {}).get("market_score"),
+                    stale=stale,
+                    quality=quality,
+                )
+                diagnostics["stale_quote"]["max_reprice_cents"] = config.stale_quote_max_reprice_cents
                 if not stale.allowed:
                     _record_gate_rejection(
                         db,
@@ -844,8 +1031,9 @@ async def run_crypto_paper_watcher(
                         source_consensus={"sources": list(current.sources), "max_deviation_pct": current.max_deviation_pct},
                         final_action="stale_quote_rejected",
                         reason=stale.reason,
-                        gate_payload={"stale_quote": stale.to_dict()},
+                        gate_payload={"stale_quote": {**stale.to_dict(), "max_reprice_cents": config.stale_quote_max_reprice_cents}},
                         fixture=config.fixture,
+                        diagnostics=diagnostics,
                     )
                     risk_rejected += 1
                     continue
@@ -891,6 +1079,7 @@ async def run_crypto_paper_watcher(
                         reason=reason,
                         gate_payload=payload,
                         fixture=config.fixture,
+                        diagnostics=diagnostics,
                     )
                     risk_rejected += 1
                     continue
@@ -911,6 +1100,7 @@ async def run_crypto_paper_watcher(
                 source_consensus={"sources": list(current.sources), "max_deviation_pct": current.max_deviation_pct},
                 open_position_count=len(open_positions),
                 fixture=config.fixture,
+                diagnostics=diagnostics,
             )
             opportunities += opp_delta
             fills += fill_delta

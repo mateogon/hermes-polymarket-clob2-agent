@@ -1,0 +1,19 @@
+campaign_v2_candidate:
+  status: paper_candidate
+  based_on: strike_calibration_round_1
+  live_allowed: false
+
+market_selection:
+  min_market_score: 0.85
+
+stale_quote:
+  max_reprice_cents: 0.5
+  stale_window_ms: 1500
+
+fair_value:
+  min_edge: 0.05
+  annualized_vol: 0.45
+
+paper:
+  amount_usd: 5
+  close_open_on_end: true

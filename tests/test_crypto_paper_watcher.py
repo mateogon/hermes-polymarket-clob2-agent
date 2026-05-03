@@ -303,5 +303,11 @@ def test_crypto_paper_watcher_v2_allows_when_gates_pass(tmp_path):
         assert summary.paper_opportunities >= 1
         signals = forward_signals(db, run_id=summary.run_id, limit=10)
         assert signals[0]["final_action"] == "paper_fill"
+        payload = json.loads(signals[0]["payload_json"])
+        assert payload["strategy_version"] == "stale_fair_value_v2"
+        assert set(["fair_value", "stale_quote", "market_score", "risk", "execution"]).issubset(payload)
+        assert payload["stale_quote"]["reason"] == "stale_quote"
+        assert payload["market_score"]["decision"] == "allowed"
+        assert payload["risk"]["reason"] == "allowed"
 
     asyncio.run(run())

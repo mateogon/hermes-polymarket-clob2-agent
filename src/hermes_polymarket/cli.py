@@ -912,18 +912,85 @@ def cmd_crypto_latency_universe(args: argparse.Namespace) -> int:
                 if strike is None:
                     continue
                 distance_pct = (price - float(strike)) / float(strike) * 100.0
-                candidates.append({**row, "current_price": price, "distance_pct": distance_pct})
+                market_score = float(row.get("score") or 0.0)
+                abs_distance = abs(distance_pct)
+                recommended = 0.25 <= abs_distance <= 2.0 and market_score >= 0.8
+                candidates.append(
+                    {
+                        **row,
+                        "current_price": price,
+                        "distance_pct": distance_pct,
+                        "market_score": market_score,
+                        "rest_book_ok": None,
+                        "l2_quality": None,
+                        "recommended": recommended,
+                        "selection_reasons": [
+                            *([] if recommended else ["outside_distance_or_score_gate"]),
+                            "score_l2_not_run" if getattr(args, "score_l2", False) else "universe_score_only",
+                        ],
+                    }
+                )
             candidates.sort(key=lambda row: abs(float(row["distance_pct"])))
             if args.auto_pick_nearest:
                 candidates = candidates[:1]
             else:
                 candidates = candidates[: args.limit]
+            if args.score_l2 and candidates:
+                from hermes_polymarket.crypto.market_quality import evaluate_market_quality
+
+                settings = _settings()
+                client = ClobV2Client(settings)
+                try:
+                    for candidate in candidates:
+                        token_quality: dict[str, Any] = {}
+                        rest_ok = True
+                        allowed = True
+                        quality_reasons: list[str] = []
+                        for outcome, token_id in (("YES", candidate.get("yes_token_id")), ("NO", candidate.get("no_token_id"))):
+                            if not token_id:
+                                rest_ok = False
+                                allowed = False
+                                token_quality[outcome] = {"allowed": False, "reason": "missing_token_id"}
+                                quality_reasons.append("missing_token_id")
+                                continue
+                            try:
+                                book = client.get_orderbook(str(token_id))
+                                quality = evaluate_market_quality(book).to_dict()
+                                token_quality[outcome] = {
+                                    "token_id": str(token_id),
+                                    "best_bid": book.best_bid,
+                                    "best_ask": book.best_ask,
+                                    "quality": quality,
+                                }
+                                if not quality.get("allowed"):
+                                    allowed = False
+                                    quality_reasons.append(str(quality.get("reason") or "quality_rejected"))
+                            except Exception as exc:  # noqa: BLE001 - candidate scoring reports per-token failures.
+                                rest_ok = False
+                                allowed = False
+                                reason = str(exc)
+                                token_quality[outcome] = {"token_id": str(token_id), "allowed": False, "reason": reason}
+                                quality_reasons.append(reason)
+                        candidate["rest_book_ok"] = rest_ok
+                        candidate["l2_quality"] = {
+                            "all_allowed": allowed,
+                            "tokens": token_quality,
+                            "reasons": sorted(set(quality_reasons)),
+                        }
+                        candidate["recommended"] = bool(candidate["recommended"] and rest_ok and allowed)
+                        candidate["selection_reasons"] = [
+                            reason for reason in candidate["selection_reasons"] if reason != "score_l2_not_run"
+                        ]
+                        candidate["selection_reasons"].append("l2_quality_ok" if rest_ok and allowed else "l2_quality_rejected")
+                finally:
+                    client.close()
             print(
                 json.dumps(
                     {
                         "mode": "measurement_paper_only",
                         "event_slug": args.event_slug,
                         "symbol": args.symbol,
+                        "current_price_source": args.current_price_source,
                         "current_price": price,
                         "consensus_sources": list(sources),
                         "max_deviation_pct": max_dev,
@@ -1512,6 +1579,32 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
     db = Database(settings.database_path)
     db.init_schema(settings.initial_bankroll)
     try:
+        config_path = getattr(args, "config", None)
+        if config_path:
+            import yaml
+
+            loaded = yaml.safe_load(Path(config_path).read_text()) or {}
+            if not isinstance(loaded, dict):
+                print(f"Config file must be a mapping: {config_path}")
+                return 2
+            market_selection = loaded.get("market_selection") or {}
+            stale_quote = loaded.get("stale_quote") or {}
+            fair_value = loaded.get("fair_value") or {}
+            paper = loaded.get("paper") or {}
+            if "min_market_score" in market_selection:
+                args.min_market_score = float(market_selection["min_market_score"])
+            if "max_reprice_cents" in stale_quote:
+                args.stale_quote_max_reprice_cents = float(stale_quote["max_reprice_cents"])
+            if "stale_window_ms" in stale_quote:
+                args.stale_quote_window_ms = int(stale_quote["stale_window_ms"])
+            if "min_edge" in fair_value:
+                args.fair_value_min_edge = float(fair_value["min_edge"])
+            if "annualized_vol" in fair_value:
+                args.fair_value_annualized_vol = float(fair_value["annualized_vol"])
+            if "amount_usd" in paper:
+                args.amount = float(paper["amount_usd"])
+            if "close_open_on_end" in paper:
+                args.close_open_on_end = bool(paper["close_open_on_end"])
         symbols = tuple(symbol.strip().lower() for symbol in args.symbols.split(",") if symbol.strip())
         if not symbols:
             print("crypto-paper watch requires at least one symbol")
@@ -1683,6 +1776,7 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                         stale_quote_window_ms=args.stale_quote_window_ms,
                         use_fair_value=args.use_fair_value,
                         fair_value_min_edge=args.fair_value_min_edge,
+                        fair_value_annualized_vol=getattr(args, "fair_value_annualized_vol", 0.60),
                         min_market_score=args.min_market_score if args.best_markets_only else 0.0,
                     ),
                     watchlist=watchlist,
@@ -1752,8 +1846,10 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                     "use_stale_quote_gate": args.use_stale_quote_gate,
                     "use_fair_value": args.use_fair_value,
                     "fair_value_min_edge": args.fair_value_min_edge,
+                    "fair_value_annualized_vol": getattr(args, "fair_value_annualized_vol", 0.60),
                     "strategy_version": "stale_fair_value_v2" if args.use_fair_value or args.use_stale_quote_gate or args.best_markets_only else "threshold_only_v1",
                     "min_market_score": args.min_market_score if args.best_markets_only else None,
+                    "config_path": config_path,
                 },
                 summary=summary_dict,
                 report=position_report,
@@ -1980,6 +2076,29 @@ def cmd_crypto_paper_campaign_summary(args: argparse.Namespace) -> int:
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_crypto_paper_v2_diagnostics(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.v2_diagnostics import v2_diagnostics
+
+    db_path = args.db or _settings().database_path
+    result = v2_diagnostics(db_path=db_path, run_id=args.run_id, include_fixture=args.include_fixture)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_crypto_paper_strike_calibration(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.strike_calibration import (
+        strike_shadow_calibration,
+        write_strike_shadow_calibration,
+    )
+
+    result = strike_shadow_calibration(args.db, include_fixture=args.include_fixture)
+    if args.output:
+        output = write_strike_shadow_calibration(result, args.output)
+        result = {**result, "artifact": str(output)}
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
@@ -2459,6 +2578,8 @@ def build_parser() -> argparse.ArgumentParser:
     universe_strike.add_argument("--event-slug", required=True)
     universe_strike.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
     universe_strike.add_argument("--limit", type=int, default=20)
+    universe_strike.add_argument("--score-l2", action="store_true")
+    universe_strike.add_argument("--current-price-source", choices=["consensus"], default="consensus")
     universe_strike.add_argument("--auto-pick-nearest", action="store_true")
     universe_strike.set_defaults(func=cmd_crypto_latency_universe)
     universe_import_best = universe_sub.add_parser("import-best")
@@ -2606,6 +2727,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     crypto_paper_watch.set_defaults(func=cmd_crypto_paper_watch)
     crypto_paper_watch_v2 = crypto_paper_sub.add_parser("watch-v2")
+    crypto_paper_watch_v2.add_argument("--config", default=None)
     crypto_paper_watch_v2.add_argument("--seconds", type=int, default=900)
     crypto_paper_watch_v2.add_argument("--symbols", default="btcusdt,xrpusdt")
     crypto_paper_watch_v2.add_argument("--from-watchlist", action="store_true", default=True)
@@ -2634,6 +2756,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_watch_v2.add_argument("--stale-quote-window-ms", type=int, default=1500)
     crypto_paper_watch_v2.add_argument("--use-fair-value", action="store_true", default=True)
     crypto_paper_watch_v2.add_argument("--fair-value-min-edge", type=float, default=0.03)
+    crypto_paper_watch_v2.add_argument("--fair-value-annualized-vol", type=float, default=0.60)
     crypto_paper_watch_v2.add_argument("--seed-rest-books", action="store_true", default=True)
     crypto_paper_watch_v2.add_argument("--close-open-on-end", action="store_true")
     crypto_paper_watch_v2.set_defaults(func=cmd_crypto_paper_watch_v2)
@@ -2691,6 +2814,16 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_campaign_summary.add_argument("--include-fixture", action="store_true")
     crypto_paper_campaign_summary.add_argument("--include-signals", action="store_true")
     crypto_paper_campaign_summary.set_defaults(func=cmd_crypto_paper_campaign_summary)
+    crypto_paper_v2_diagnostics = crypto_paper_sub.add_parser("v2-diagnostics")
+    crypto_paper_v2_diagnostics.add_argument("--db", default=None)
+    crypto_paper_v2_diagnostics.add_argument("--run-id", default=None)
+    crypto_paper_v2_diagnostics.add_argument("--include-fixture", action="store_true")
+    crypto_paper_v2_diagnostics.set_defaults(func=cmd_crypto_paper_v2_diagnostics)
+    crypto_paper_strike_calibration = crypto_paper_sub.add_parser("strike-calibration")
+    crypto_paper_strike_calibration.add_argument("--db", action="append", required=True)
+    crypto_paper_strike_calibration.add_argument("--output", default=None)
+    crypto_paper_strike_calibration.add_argument("--include-fixture", action="store_true")
+    crypto_paper_strike_calibration.set_defaults(func=cmd_crypto_paper_strike_calibration)
     crypto_paper_loss = crypto_paper_sub.add_parser("loss-attribution")
     crypto_paper_loss.add_argument("--db-glob", action="append", required=True)
     crypto_paper_loss.add_argument("--output", default="artifacts/evidence/loss_attribution.json")
