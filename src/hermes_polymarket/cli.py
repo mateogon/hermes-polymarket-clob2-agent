@@ -839,6 +839,112 @@ def cmd_crypto_latency_discover_updown(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_crypto_latency_universe(args: argparse.Namespace) -> int:
+    from hermes_polymarket.crypto.market_universe import (
+        candidate_to_watchlist_row,
+        fetch_gamma_universe,
+        filter_universe_candidates,
+        load_universe_scan,
+        scan_market_universe,
+        write_universe_scan,
+    )
+    from hermes_polymarket.crypto.watchlist_seeding import current_reference_consensus
+    from hermes_polymarket.polymarket.gamma_client import GammaClient
+    from hermes_polymarket.storage.crypto_watchlist import crypto_market_watchlist, upsert_crypto_market_watchlist
+
+    symbols = {symbol.strip().lower() for symbol in args.symbols.split(",") if symbol.strip()} if hasattr(args, "symbols") else None
+
+    if args.universe_action == "scan":
+        if not symbols:
+            print("universe scan requires at least one symbol")
+            return 2
+        gamma = GammaClient()
+        try:
+            events, markets = fetch_gamma_universe(gamma, limit_events=args.limit_events, limit_markets=args.limit_markets)
+            payload = scan_market_universe(events=events, markets=markets, symbols=symbols)
+            payload["symbols"] = sorted(symbols)
+            payload["limits"] = {"events": args.limit_events, "markets": args.limit_markets}
+            output = Path(args.output)
+            write_universe_scan(output, payload)
+            payload["output"] = str(output)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        finally:
+            gamma.close()
+        return 0
+
+    if args.universe_action == "candidates":
+        payload = load_universe_scan(Path(args.file))
+        rows = filter_universe_candidates(payload, market_type=args.market_type, min_score=args.min_score, limit=args.limit)
+        print(
+            json.dumps(
+                {
+                    "mode": "measurement_paper_only",
+                    "file": args.file,
+                    "market_type": args.market_type,
+                    "min_score": args.min_score,
+                    "candidates": rows,
+                    "count": len(rows),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.universe_action == "import-best":
+        if args.market_type != "up_down":
+            print(json.dumps({"status": "unsupported_market_type", "reason": "import-best currently supports up_down only"}, indent=2, sort_keys=True))
+            return 2
+        payload = load_universe_scan(Path(args.file))
+        rows = filter_universe_candidates(payload, market_type=args.market_type, min_score=args.min_score, limit=args.limit)
+        settings = _settings()
+        db = Database(settings.database_path)
+        db.init_schema(settings.initial_bankroll)
+        imported: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        try:
+            references: dict[str, Any] = {}
+            for candidate in rows:
+                symbol = str(candidate.get("symbol") or "")
+                reference = references.get(symbol)
+                if symbol and symbol not in references:
+                    try:
+                        reference = current_reference_consensus(symbol)
+                    except Exception as exc:  # noqa: BLE001 - import can continue without reference.
+                        reference = None
+                        skipped.append({"slug": candidate.get("slug"), "reason": f"reference_unavailable:{exc}"})
+                    references[symbol] = reference
+                if reference is None:
+                    continue
+                row = candidate_to_watchlist_row(candidate, reference=reference, duration_seconds=args.duration_seconds)
+                if row is None:
+                    skipped.append({"slug": candidate.get("slug"), "reason": "not_importable_or_direction_mapping_ambiguous"})
+                    continue
+                upsert_crypto_market_watchlist(db, row)
+                imported.append({"condition_id": row["condition_id"], "slug": row["slug"], "symbol": row["symbol"], "score": candidate.get("score")})
+            watchlist = crypto_market_watchlist(db, active_only=False, limit=50)
+            print(
+                json.dumps(
+                    {
+                        "mode": "measurement_paper_only",
+                        "status": "imported_best" if imported else "no_candidates_imported",
+                        "file": args.file,
+                        "imported": imported,
+                        "skipped": skipped,
+                        "watchlist": watchlist,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        finally:
+            db.close()
+        return 0
+
+    print(f"unknown universe action: {args.universe_action}")
+    return 2
+
+
 def cmd_crypto_latency_record(args: argparse.Namespace) -> int:
     from hermes_polymarket.crypto.latency_recorder import RecorderConfig, run_crypto_latency_recorder
     from hermes_polymarket.data_sources.base import DataEvent, EventType, now_ms
@@ -2209,6 +2315,27 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_discover_updown.add_argument("--limit", type=int, default=300)
     crypto_discover_updown.add_argument("--debug", action="store_true")
     crypto_discover_updown.set_defaults(func=cmd_crypto_latency_discover_updown)
+    crypto_universe = crypto_sub.add_parser("universe")
+    universe_sub = crypto_universe.add_subparsers(dest="universe_action", required=True)
+    universe_scan = universe_sub.add_parser("scan")
+    universe_scan.add_argument("--symbols", default="btcusdt,ethusdt,solusdt,xrpusdt")
+    universe_scan.add_argument("--limit-events", type=int, default=1000)
+    universe_scan.add_argument("--limit-markets", type=int, default=1000)
+    universe_scan.add_argument("--output", default="artifacts/universe/latest.json")
+    universe_scan.set_defaults(func=cmd_crypto_latency_universe)
+    universe_candidates = universe_sub.add_parser("candidates")
+    universe_candidates.add_argument("--file", default="artifacts/universe/latest.json")
+    universe_candidates.add_argument("--market-type", choices=["up_down", "above_strike", "below_strike", "multi_strike_event", "unsupported"], default=None)
+    universe_candidates.add_argument("--min-score", type=float, default=0.0)
+    universe_candidates.add_argument("--limit", type=int, default=20)
+    universe_candidates.set_defaults(func=cmd_crypto_latency_universe)
+    universe_import_best = universe_sub.add_parser("import-best")
+    universe_import_best.add_argument("--file", default="artifacts/universe/latest.json")
+    universe_import_best.add_argument("--market-type", choices=["up_down", "above_strike", "below_strike", "multi_strike_event", "unsupported"], default="up_down")
+    universe_import_best.add_argument("--limit", type=int, default=5)
+    universe_import_best.add_argument("--min-score", type=float, default=0.75)
+    universe_import_best.add_argument("--duration-seconds", type=int, default=900)
+    universe_import_best.set_defaults(func=cmd_crypto_latency_universe)
     crypto_record = crypto_sub.add_parser("record")
     crypto_record.add_argument("--seconds", type=int, default=300)
     crypto_record.add_argument("--symbols", default="btcusdt,ethusdt,solusdt,xrpusdt")
