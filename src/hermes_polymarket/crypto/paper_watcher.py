@@ -20,6 +20,7 @@ from hermes_polymarket.crypto.fair_value import evaluate_fair_value_edge
 from hermes_polymarket.crypto.market_quality import MarketQualityDecision, evaluate_market_quality
 from hermes_polymarket.crypto.market_score import _token_score
 from hermes_polymarket.crypto.runtime_state import CryptoRuntimeState
+from hermes_polymarket.crypto.strike_fair_value import fair_value_above_strike, fair_value_below_strike
 from hermes_polymarket.crypto.stale_quote_gate import evaluate_stale_quote
 from hermes_polymarket.data_sources.base import DataEvent, EventType
 from hermes_polymarket.data_sources.event_bus import EventBus
@@ -125,6 +126,85 @@ def directional_tokens(watchlist: list[dict[str, Any]]) -> list[DirectionalToken
         if down_token:
             tokens.append(DirectionalToken(symbol, condition_id, str(down_token), "DOWN", "down"))
     return tokens
+
+
+def _strike_watchlist(watchlist: list[dict[str, Any]], symbol: str) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in watchlist
+        if str(row.get("symbol") or "").lower() == symbol
+        and str(row.get("market_type") or "up_down") in {"above_strike", "below_strike"}
+    ]
+
+
+def _select_strike_token(
+    *,
+    watchlist: list[dict[str, Any]],
+    token_map: dict[str, dict[str, Any]],
+    book_state: OrderBookState,
+    symbol: str,
+    current_price: float,
+    detected_ts_ms: int,
+    min_edge: float,
+) -> tuple[DirectionalToken | None, dict[str, Any] | None, str, dict[str, Any]]:
+    best: tuple[float, DirectionalToken, dict[str, Any], dict[str, Any]] | None = None
+    considered = 0
+    for market in _strike_watchlist(watchlist, symbol):
+        considered += 1
+        strike_price = market.get("strike_price")
+        comparator = str(market.get("comparator") or "")
+        resolution_ts = market.get("resolution_ts") or market.get("end_ts_ms")
+        if strike_price is None:
+            continue
+        if resolution_ts is None:
+            continue
+        if float(resolution_ts) > 10_000_000_000:
+            seconds_to_expiry = float(resolution_ts) / 1000.0 - detected_ts_ms / 1000.0
+        else:
+            seconds_to_expiry = float(resolution_ts) - detected_ts_ms / 1000.0
+        if seconds_to_expiry <= 0:
+            continue
+        if comparator == "below":
+            fair = fair_value_below_strike(current_price=current_price, strike_price=float(strike_price), seconds_to_expiry=seconds_to_expiry)
+        else:
+            fair = fair_value_above_strike(current_price=current_price, strike_price=float(strike_price), seconds_to_expiry=seconds_to_expiry)
+
+        token_edges: list[tuple[float, str, str, float | None]] = []
+        yes_token = str(market.get("yes_token_id") or "")
+        no_token = str(market.get("no_token_id") or "")
+        yes_state = book_state.by_token.get(yes_token)
+        no_state = book_state.by_token.get(no_token)
+        if yes_state is not None and yes_state.best_ask is not None:
+            token_edges.append((fair.probability_yes - float(yes_state.best_ask), yes_token, "YES", yes_state.best_ask))
+        if no_state is not None and no_state.best_ask is not None:
+            token_edges.append(((1.0 - fair.probability_yes) - float(no_state.best_ask), no_token, "NO", no_state.best_ask))
+        if not token_edges:
+            continue
+        edge, token_id, outcome, ask = max(token_edges, key=lambda item: item[0])
+        payload = {
+            "market_type": market.get("market_type"),
+            "strike_price": strike_price,
+            "comparator": comparator,
+            "current_price": current_price,
+            "seconds_to_expiry": seconds_to_expiry,
+            "probability_yes": fair.probability_yes,
+            "distance_pct": fair.distance_pct,
+            "selected_side": outcome,
+            "selected_edge": edge,
+            "selected_ask": ask,
+            "fair_value_reason": fair.reason,
+        }
+        if edge >= min_edge:
+            selected = DirectionalToken(symbol, str(market.get("condition_id") or ""), token_id, outcome, f"{comparator}_strike")
+            market_for_token = token_map.get(token_id)
+            if market_for_token is not None and (best is None or edge > best[0]):
+                best = (edge, selected, market_for_token, payload)
+
+    if best is not None:
+        return best[1], best[2], "strike_fair_value_edge", best[3]
+    if considered:
+        return None, None, "fair_value_edge_below_min", {"strike_markets_considered": considered}
+    return None, None, "no_strike_markets_for_symbol", {}
 
 
 def _persist_signal_event(
@@ -641,8 +721,18 @@ async def run_crypto_paper_watcher(
         runtime_state.last_event_ts_by_symbol[current.symbol] = event.received_ts_ms
         signals_generated += 1
         latency_events += 1
-        selected = select_directional_token(tokens=directional, symbol=current.symbol, move_pct=signal.external_move_pct)
-        market = token_map.get(selected.token_id) if selected else None
+        selected, market, strike_reason, strike_payload = _select_strike_token(
+            watchlist=watchlist,
+            token_map=token_map,
+            book_state=book_state,
+            symbol=current.symbol,
+            current_price=signal.current_price,
+            detected_ts_ms=signal.detected_ts_ms,
+            min_edge=config.fair_value_min_edge,
+        )
+        if selected is None:
+            selected = select_directional_token(tokens=directional, symbol=current.symbol, move_pct=signal.external_move_pct)
+            market = token_map.get(selected.token_id) if selected else None
         _persist_signal_event(
             db,
             event_id=signal.event_id,
@@ -669,12 +759,13 @@ async def run_crypto_paper_watcher(
                     "direction": desired_direction_from_move(signal.external_move_pct),
                     "external_move_ts_ms": signal.detected_ts_ms,
                     "external_move_pct": signal.external_move_pct,
-                    "final_action": "risk_rejected",
-                    "risk_reason": "direction_mapping_missing" if not directional else "direction_mapping_ambiguous",
+                    "final_action": "fair_value_rejected" if strike_reason == "fair_value_edge_below_min" else "risk_rejected",
+                    "risk_reason": strike_reason if strike_reason != "no_strike_markets_for_symbol" else ("direction_mapping_missing" if not directional else "direction_mapping_ambiguous"),
                     "fill_status": None,
                     "amount_usd": config.amount_usd,
                     "model_probability": config.model_probability,
                     "fixture": config.fixture,
+                    "payload": strike_payload,
                 },
             )
             risk_rejected += 1
@@ -759,24 +850,29 @@ async def run_crypto_paper_watcher(
                     risk_rejected += 1
                     continue
             if config.use_fair_value:
-                ref = watchlist_reference(market)
-                reference_price = ref.get("reference_price")
-                window_end_ts = ref.get("window_end_ts")
-                if reference_price is None or window_end_ts is None or quality.best_ask is None:
-                    reason = "reference_price_missing"
-                    payload = {"fair_value": {"allowed": False, "reason": reason, "reference": ref}}
+                if str(market.get("market_type") or "up_down") in {"above_strike", "below_strike"}:
+                    selected_edge = float((strike_payload or {}).get("selected_edge") or 0.0)
+                    reason = "fair_value_edge" if selected_edge >= config.fair_value_min_edge else "fair_value_edge_below_min"
+                    payload = {"strike_fair_value": strike_payload or {}}
                 else:
-                    seconds_to_expiry = max(1.0, float(window_end_ts) - signal.detected_ts_ms / 1000.0)
-                    fair = evaluate_fair_value_edge(
-                        direction=selected.direction,
-                        current_price=signal.current_price,
-                        reference_price=float(reference_price),
-                        seconds_to_expiry=seconds_to_expiry,
-                        executable_price=float(quality.best_ask),
-                        min_edge=config.fair_value_min_edge,
-                    )
-                    reason = fair.reason
-                    payload = {"fair_value": fair.to_dict()}
+                    ref = watchlist_reference(market)
+                    reference_price = ref.get("reference_price")
+                    window_end_ts = ref.get("window_end_ts")
+                    if reference_price is None or window_end_ts is None or quality.best_ask is None:
+                        reason = "reference_price_missing"
+                        payload = {"fair_value": {"allowed": False, "reason": reason, "reference": ref}}
+                    else:
+                        seconds_to_expiry = max(1.0, float(window_end_ts) - signal.detected_ts_ms / 1000.0)
+                        fair = evaluate_fair_value_edge(
+                            direction=selected.direction,
+                            current_price=signal.current_price,
+                            reference_price=float(reference_price),
+                            seconds_to_expiry=seconds_to_expiry,
+                            executable_price=float(quality.best_ask),
+                            min_edge=config.fair_value_min_edge,
+                        )
+                        reason = fair.reason
+                        payload = {"fair_value": fair.to_dict()}
                 if reason != "fair_value_edge":
                     _record_gate_rejection(
                         db,

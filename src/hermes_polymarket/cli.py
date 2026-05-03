@@ -891,6 +891,53 @@ def cmd_crypto_latency_universe(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if args.universe_action == "strike-candidates":
+        if not args.symbol:
+            print("strike-candidates requires --symbol")
+            return 2
+        gamma = GammaClient()
+        try:
+            events = gamma.list_events(slug=args.event_slug, active="true", closed="false", limit=5)
+            if not events:
+                print(json.dumps({"status": "event_not_found", "event_slug": args.event_slug}, indent=2, sort_keys=True))
+                return 2
+            event = events[0]
+            payload = scan_market_universe(events=[event], markets=[], symbols={args.symbol})
+            price, sources, max_dev = current_reference_consensus(args.symbol)
+            candidates: list[dict[str, Any]] = []
+            for row in filter_universe_candidates(payload, market_type=None, min_score=0.0, limit=500):
+                if row.get("market_type") not in {"above_strike", "below_strike"}:
+                    continue
+                strike = row.get("strike_price")
+                if strike is None:
+                    continue
+                distance_pct = (price - float(strike)) / float(strike) * 100.0
+                candidates.append({**row, "current_price": price, "distance_pct": distance_pct})
+            candidates.sort(key=lambda row: abs(float(row["distance_pct"])))
+            if args.auto_pick_nearest:
+                candidates = candidates[:1]
+            else:
+                candidates = candidates[: args.limit]
+            print(
+                json.dumps(
+                    {
+                        "mode": "measurement_paper_only",
+                        "event_slug": args.event_slug,
+                        "symbol": args.symbol,
+                        "current_price": price,
+                        "consensus_sources": list(sources),
+                        "max_deviation_pct": max_dev,
+                        "candidates": candidates,
+                        "recommendation": "prefer near-atm with good liquidity",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        finally:
+            gamma.close()
+        return 0
+
     if args.universe_action == "import-best":
         if args.market_type != "up_down":
             print(json.dumps({"status": "unsupported_market_type", "reason": "import-best currently supports up_down only"}, indent=2, sort_keys=True))
@@ -1166,6 +1213,10 @@ def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
                             "condition_id": seed.condition_id,
                             "slug": seed.slug,
                             "symbol": seed.symbol,
+                            "market_type": seed.market_type,
+                            "strike_price": seed.strike_price,
+                            "comparator": seed.comparator,
+                            "resolution_ts": seed.resolution_ts,
                             "reference_price": seed.reference_price,
                             "window_start_ts": seed.window_start_ts,
                             "window_end_ts": seed.window_end_ts,
@@ -1214,6 +1265,10 @@ def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
                         "no_token_id": no_token_id,
                         "up_token_id": up_token_id,
                         "down_token_id": down_token_id,
+                        "market_type": market.get("market_type", "up_down"),
+                        "strike_price": market.get("strike_price"),
+                        "comparator": market.get("comparator"),
+                        "resolution_ts": market.get("resolution_ts"),
                         "direction_map": {"up": up_token_id, "down": down_token_id} if up_token_id and down_token_id else {},
                         "active": bool(market.get("active", True)),
                         "discovered_at_ms": int(market.get("discovered_at_ms") or now_ms()),
@@ -2329,6 +2384,12 @@ def build_parser() -> argparse.ArgumentParser:
     universe_candidates.add_argument("--min-score", type=float, default=0.0)
     universe_candidates.add_argument("--limit", type=int, default=20)
     universe_candidates.set_defaults(func=cmd_crypto_latency_universe)
+    universe_strike = universe_sub.add_parser("strike-candidates")
+    universe_strike.add_argument("--event-slug", required=True)
+    universe_strike.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    universe_strike.add_argument("--limit", type=int, default=20)
+    universe_strike.add_argument("--auto-pick-nearest", action="store_true")
+    universe_strike.set_defaults(func=cmd_crypto_latency_universe)
     universe_import_best = universe_sub.add_parser("import-best")
     universe_import_best.add_argument("--file", default="artifacts/universe/latest.json")
     universe_import_best.add_argument("--market-type", choices=["up_down", "above_strike", "below_strike", "multi_strike_event", "unsupported"], default="up_down")
@@ -2370,7 +2431,7 @@ def build_parser() -> argparse.ArgumentParser:
     watchlist_add_current.add_argument("--slug", required=True)
     watchlist_add_current.add_argument("--symbol", default=None, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
     watchlist_add_current.add_argument("--duration-seconds", type=int, default=900)
-    watchlist_add_current.add_argument("--yes-direction", choices=["up", "down"], required=True)
+    watchlist_add_current.add_argument("--yes-direction", choices=["up", "down"], default=None)
     watchlist_add_current.add_argument("--min-sources", type=int, default=2)
     watchlist_add_current.add_argument("--max-deviation-pct", type=float, default=0.25)
     watchlist_clear = watchlist_sub.add_parser("clear")

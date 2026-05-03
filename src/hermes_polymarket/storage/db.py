@@ -42,6 +42,10 @@ class Database:
             {
                 "up_token_id": "TEXT",
                 "down_token_id": "TEXT",
+                "market_type": "TEXT NOT NULL DEFAULT 'up_down'",
+                "strike_price": "REAL",
+                "comparator": "TEXT",
+                "resolution_ts": "INTEGER",
                 "direction_map_json": "TEXT NOT NULL DEFAULT '{}'",
             },
         )

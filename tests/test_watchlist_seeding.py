@@ -67,6 +67,46 @@ def test_seed_current_window_from_slug_resolves_gamma_and_reference():
     assert set(seed.consensus_sources) == {"binance_rest", "coinbase_rest", "kraken_rest"}
 
 
+def test_seed_current_window_detects_strike_market_without_yes_direction():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "gamma-api.polymarket.com":
+            return _json_response(
+                [
+                    {
+                        "conditionId": "condition",
+                        "slug": "bitcoin-above-78k-on-may-3",
+                        "question": "Will Bitcoin be above $78,000 on May 3?",
+                        "clobTokenIds": '["yes-token", "no-token"]',
+                        "active": True,
+                        "endDate": "2027-05-03T00:00:00Z",
+                    }
+                ]
+            )
+        if "binance" in request.url.host:
+            return _json_response({"price": "79000.0"})
+        if "coinbase" in request.url.host:
+            return _json_response({"price": "79010.0"})
+        if "kraken" in request.url.host:
+            return _json_response({"result": {"XXBTZUSD": {"c": ["79005.0", "1"]}}})
+        raise AssertionError(str(request.url))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    seed = seed_current_window_from_slug(
+        slug="bitcoin-above-78k-on-may-3",
+        symbol="btcusdt",
+        yes_direction=None,
+        duration_seconds=900,
+        now_ts=123,
+        http_client=client,
+    )
+
+    assert seed.market_type == "above_strike"
+    assert seed.comparator == "above"
+    assert seed.strike_price == 78000
+    assert seed.up_token_id == ""
+    assert seed.down_token_id == ""
+
+
 def test_seed_current_window_falls_back_to_event_slug_with_single_market():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "gamma-api.polymarket.com" and request.url.path == "/markets":

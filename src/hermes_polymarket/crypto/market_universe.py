@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_polymarket.crypto.crypto_market_classifier import infer_symbol_from_text
+from hermes_polymarket.crypto.strike_market import parse_strike_market
 from hermes_polymarket.crypto.updown_discovery import UPDOWN_PATTERNS
 from hermes_polymarket.data_sources.base import now_ms
 from hermes_polymarket.polymarket.gamma_client import GammaClient
@@ -36,6 +37,8 @@ class UniverseCandidate:
     no_token_id: str | None
     up_token_id: str | None
     down_token_id: str | None
+    strike_price: float | None
+    comparator: str | None
     outcomes: tuple[str, ...]
     end_date: str | None
     active: bool
@@ -57,6 +60,8 @@ class UniverseCandidate:
             "no_token_id": self.no_token_id,
             "up_token_id": self.up_token_id,
             "down_token_id": self.down_token_id,
+            "strike_price": self.strike_price,
+            "comparator": self.comparator,
             "outcomes": list(self.outcomes),
             "end_date": self.end_date,
             "active": self.active,
@@ -180,12 +185,12 @@ def classify_market_type(market: dict[str, Any], *, event: dict[str, Any] | None
         return "unsupported", None
     if _is_updown_text(text) and not _is_strike_text(text):
         return "up_down", symbol
-    if multi_strike_event and _is_strike_text(text):
-        return "multi_strike_event", symbol
     if "above" in text or "over" in text:
         return "above_strike", symbol
     if "below" in text or "under" in text:
         return "below_strike", symbol
+    if multi_strike_event and _is_strike_text(text):
+        return "multi_strike_event", symbol
     return "unsupported", symbol
 
 
@@ -204,6 +209,9 @@ def build_candidate(
         return None
 
     text = _text(market, event)
+    strike = parse_strike_market(text)
+    if strike is not None:
+        market_type = strike.market_type
     outcomes = _outcomes(market)
     token_ids = _token_ids(market)
     active = bool(market.get("active", False))
@@ -272,6 +280,8 @@ def build_candidate(
         no_token_id=no_token_id,
         up_token_id=up_token_id,
         down_token_id=down_token_id,
+        strike_price=strike.strike_price if strike is not None else None,
+        comparator=strike.comparator if strike is not None else None,
         outcomes=outcomes,
         end_date=str(market.get("endDate") or "") or None,
         active=active,
@@ -414,19 +424,24 @@ def filter_universe_candidates(
 
 
 def candidate_to_watchlist_row(candidate: dict[str, Any], *, reference: ConsensusPrice | None, duration_seconds: int) -> dict[str, Any] | None:
-    if candidate.get("market_type") != "up_down":
+    market_type = str(candidate.get("market_type") or "up_down")
+    if market_type not in {"up_down", "above_strike", "below_strike"}:
         return None
     up_token_id = candidate.get("up_token_id")
     down_token_id = candidate.get("down_token_id")
     yes_token_id = candidate.get("yes_token_id")
     no_token_id = candidate.get("no_token_id")
-    if not all((up_token_id, down_token_id, yes_token_id, no_token_id)):
+    if market_type == "up_down" and not all((up_token_id, down_token_id, yes_token_id, no_token_id)):
+        return None
+    if market_type in {"above_strike", "below_strike"} and not all((yes_token_id, no_token_id, candidate.get("strike_price"), candidate.get("comparator"))):
         return None
     start_ms = now_ms()
     end_ts_ms = start_ms + duration_seconds * 1000
     raw: dict[str, Any] = {
         "universe_import": True,
-        "market_type": candidate.get("market_type"),
+        "market_type": market_type,
+        "strike_price": candidate.get("strike_price"),
+        "comparator": candidate.get("comparator"),
         "universe_score": candidate.get("score"),
         "universe_reasons": candidate.get("reasons") or [],
     }
@@ -449,7 +464,11 @@ def candidate_to_watchlist_row(candidate: dict[str, Any], *, reference: Consensu
         "no_token_id": no_token_id,
         "up_token_id": up_token_id,
         "down_token_id": down_token_id,
-        "direction_map": {"up": up_token_id, "down": down_token_id},
+        "market_type": market_type,
+        "strike_price": candidate.get("strike_price"),
+        "comparator": candidate.get("comparator"),
+        "resolution_ts": end_ts_ms // 1000,
+        "direction_map": {"up": up_token_id, "down": down_token_id} if up_token_id and down_token_id else {},
         "active": True,
         "discovered_at_ms": start_ms,
         "end_ts_ms": end_ts_ms,

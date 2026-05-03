@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
 from hermes_polymarket.crypto.market_resolver import infer_crypto_symbol, market_window_from_gamma_market
+from hermes_polymarket.crypto.strike_market import parse_strike_market
 from hermes_polymarket.data_sources.base import now_ms
 from hermes_polymarket.signals.source_consensus import PriceReading, consensus_price
 
@@ -35,6 +37,10 @@ class WatchlistSeed:
     window_end_ts: int
     consensus_sources: tuple[str, ...]
     max_deviation_pct: float
+    market_type: str = "up_down"
+    strike_price: float | None = None
+    comparator: str | None = None
+    resolution_ts: int | None = None
 
     def to_watchlist_row(self) -> dict[str, Any]:
         return {
@@ -46,12 +52,19 @@ class WatchlistSeed:
             "no_token_id": self.no_token_id,
             "up_token_id": self.up_token_id,
             "down_token_id": self.down_token_id,
+            "market_type": self.market_type,
+            "strike_price": self.strike_price,
+            "comparator": self.comparator,
+            "resolution_ts": self.resolution_ts,
             "direction_map": {"up": self.up_token_id, "down": self.down_token_id},
             "active": True,
             "discovered_at_ms": self.window_start_ts * 1000,
             "end_ts_ms": self.window_end_ts * 1000,
             "raw": {
                 "manual_current_window": True,
+                "market_type": self.market_type,
+                "strike_price": self.strike_price,
+                "comparator": self.comparator,
                 "reference_price": self.reference_price,
                 "window_start_ts": self.window_start_ts,
                 "window_end_ts": self.window_end_ts,
@@ -89,6 +102,19 @@ def _token_ids(market: dict[str, Any]) -> tuple[str, str] | None:
 
 def _is_open_market(market: dict[str, Any]) -> bool:
     return bool(market.get("active", True)) and not bool(market.get("closed"))
+
+
+def _end_date_ts(market: dict[str, Any]) -> int | None:
+    value = market.get("endDate")
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
 
 
 def _event_markets(event: dict[str, Any]) -> list[dict[str, Any]]:
@@ -229,14 +255,14 @@ def seed_current_window_from_slug(
     *,
     slug: str,
     symbol: str | None = None,
-    yes_direction: str,
+    yes_direction: str | None = None,
     duration_seconds: int,
     http_client: httpx.Client | None = None,
     now_ts: int | None = None,
     min_sources: int = 2,
     max_deviation_pct: float = 0.25,
 ) -> WatchlistSeed:
-    if yes_direction not in {"up", "down"}:
+    if yes_direction is not None and yes_direction not in {"up", "down"}:
         raise ValueError("yes_direction must be up or down")
     if duration_seconds <= 0:
         raise ValueError("duration_seconds must be positive")
@@ -251,6 +277,7 @@ def seed_current_window_from_slug(
         tokens = _token_ids(market)
         condition_id = str(market.get("conditionId") or market.get("condition_id") or "")
         question = str(market.get("question") or market.get("title") or slug)
+        strike = parse_strike_market(f"{question} {market.get('slug') or slug}")
         inferred_symbol = symbol or (resolved or {}).get("symbol") or infer_crypto_symbol(f"{slug} {question}")
         if not inferred_symbol:
             raise ValueError(f"Could not infer symbol for slug: {slug}; pass --symbol")
@@ -260,10 +287,16 @@ def seed_current_window_from_slug(
             raise ValueError(f"Could not find conditionId for slug: {slug}")
 
         yes_token_id, no_token_id = tokens
-        if yes_direction == "up":
-            up_token_id, down_token_id = yes_token_id, no_token_id
+        market_type = strike.market_type if strike is not None else "up_down"
+        if market_type == "up_down":
+            if yes_direction is None:
+                raise ValueError("yes_direction is required for up_down markets")
+            if yes_direction == "up":
+                up_token_id, down_token_id = yes_token_id, no_token_id
+            else:
+                up_token_id, down_token_id = no_token_id, yes_token_id
         else:
-            up_token_id, down_token_id = no_token_id, yes_token_id
+            up_token_id, down_token_id = "", ""
 
         reference_price, sources, max_dev = current_reference_consensus(
             str(inferred_symbol).lower(),
@@ -272,6 +305,7 @@ def seed_current_window_from_slug(
             max_deviation_pct=max_deviation_pct,
         )
         start_ts = int(now_ts if now_ts is not None else now_ms() // 1000)
+        resolution_ts = _end_date_ts(market) or start_ts + int(duration_seconds)
         return WatchlistSeed(
             condition_id=condition_id,
             slug=str(market.get("slug") or slug),
@@ -281,6 +315,10 @@ def seed_current_window_from_slug(
             no_token_id=no_token_id,
             up_token_id=up_token_id,
             down_token_id=down_token_id,
+            market_type=market_type,
+            strike_price=strike.strike_price if strike is not None else None,
+            comparator=strike.comparator if strike is not None else None,
+            resolution_ts=resolution_ts,
             reference_price=reference_price,
             window_start_ts=start_ts,
             window_end_ts=start_ts + int(duration_seconds),
