@@ -238,3 +238,186 @@ def test_rotate_strikes_imports_top_candidate_and_clears_old(monkeypatch, tmp_pa
     assert watchlist[0]["slug"] == "bitcoin-above-78k-on-may-3"
     assert watchlist[0]["strike_price"] == 78000.0
     assert '"reference_price": 78500.0' in watchlist[0]["raw_json"]
+
+
+def test_wait_for_strike_stops_when_candidate_imports(monkeypatch, tmp_path, capsys):
+    class FakeGamma:
+        def list_events(self, **_kwargs):
+            return [
+                {
+                    "slug": "bitcoin-above-on-may-3",
+                    "title": "Bitcoin above on May 3",
+                    "markets": [
+                        _market(
+                            conditionId="new-condition",
+                            question="Will Bitcoin be above $78,000 on May 3?",
+                            slug="bitcoin-above-78k-on-may-3",
+                            outcomes='["Yes", "No"]',
+                            clobTokenIds='["yes-token", "no-token"]',
+                        )
+                    ],
+                }
+            ]
+
+        def close(self):
+            pass
+
+    class FakeClob:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_orderbook(self, token_id):
+            return OrderBook(token_id=token_id, bids=(OrderBookLevel(0.49, 100),), asks=(OrderBookLevel(0.50, 100),))
+
+        def close(self):
+            pass
+
+    monkeypatch.setenv("HERMES_DATABASE_PATH", str(tmp_path / "x.sqlite3"))
+    monkeypatch.setattr("hermes_polymarket.cli.GammaClient", FakeGamma)
+    monkeypatch.setattr("hermes_polymarket.cli.ClobV2Client", FakeClob)
+    monkeypatch.setattr("hermes_polymarket.crypto.watchlist_seeding.current_reference_consensus", lambda _symbol: (78500.0, ("binance", "coinbase"), 0.01))
+
+    assert main(
+        [
+            "crypto-latency",
+            "watchlist",
+            "wait-for-strike",
+            "--symbol",
+            "btcusdt",
+            "--event-slug",
+            "bitcoin-above-on-may-3",
+            "--max-markets",
+            "1",
+            "--min-score",
+            "0.75",
+            "--poll-seconds",
+            "0",
+            "--max-attempts",
+            "3",
+        ]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "found"
+    assert payload["attempts"] == 1
+    assert payload["imported"] == 1
+    assert payload["selected"][0]["slug"] == "bitcoin-above-78k-on-may-3"
+    assert payload["smoke"] is None
+
+
+def test_wait_for_strike_returns_not_found_after_max_attempts(monkeypatch, tmp_path, capsys):
+    class FakeGamma:
+        def list_events(self, **_kwargs):
+            return [
+                {
+                    "slug": "bitcoin-above-on-may-3",
+                    "title": "Bitcoin above on May 3",
+                    "markets": [
+                        _market(
+                            conditionId="extreme-condition",
+                            question="Will Bitcoin be above $78,000 on May 3?",
+                            slug="bitcoin-above-78k-on-may-3",
+                            outcomes='["Yes", "No"]',
+                            clobTokenIds='["yes-token", "no-token"]',
+                        )
+                    ],
+                }
+            ]
+
+        def close(self):
+            pass
+
+    class FakeClob:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_orderbook(self, token_id):
+            return OrderBook(token_id=token_id, bids=(OrderBookLevel(0.98, 100),), asks=(OrderBookLevel(0.984, 100),))
+
+        def close(self):
+            pass
+
+    monkeypatch.setenv("HERMES_DATABASE_PATH", str(tmp_path / "x.sqlite3"))
+    monkeypatch.setattr("hermes_polymarket.cli.GammaClient", FakeGamma)
+    monkeypatch.setattr("hermes_polymarket.cli.ClobV2Client", FakeClob)
+    monkeypatch.setattr("hermes_polymarket.crypto.watchlist_seeding.current_reference_consensus", lambda _symbol: (78500.0, ("binance", "coinbase"), 0.01))
+
+    assert (
+        main(
+            [
+                "crypto-latency",
+                "watchlist",
+                "wait-for-strike",
+                "--symbol",
+                "btcusdt",
+                "--event-slug",
+                "bitcoin-above-on-may-3",
+                "--max-markets",
+                "1",
+                "--min-score",
+                "0.75",
+                "--poll-seconds",
+                "0",
+                "--max-attempts",
+                "2",
+            ]
+        )
+        == 2
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "not_found"
+    assert payload["attempts"] == 2
+    assert len(payload["attempt_log"]) == 2
+
+
+def test_universe_strike_events_lists_candidate_events(monkeypatch, capsys):
+    class FakeGamma:
+        def list_events(self, **kwargs):
+            if kwargs.get("offset", 0) > 0:
+                return []
+            return [
+                {
+                    "slug": "bitcoin-above-on-may-3",
+                    "title": "Bitcoin above on May 3",
+                    "markets": [
+                        _market(
+                            conditionId="above-78",
+                            question="Will Bitcoin be above $78,000 on May 3?",
+                            slug="bitcoin-above-78k-on-may-3",
+                            outcomes='["Yes", "No"]',
+                            clobTokenIds='["yes-token", "no-token"]',
+                        ),
+                        _market(
+                            conditionId="above-80",
+                            question="Will Bitcoin be above $80,000 on May 3?",
+                            slug="bitcoin-above-80k-on-may-3",
+                            outcomes='["Yes", "No"]',
+                            clobTokenIds='["yes-token-2", "no-token-2"]',
+                        ),
+                    ],
+                }
+            ]
+
+        def list_markets(self, **_kwargs):
+            return []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermes_polymarket.polymarket.gamma_client.GammaClient", FakeGamma)
+
+    assert main(
+        [
+            "crypto-latency",
+            "universe",
+            "strike-events",
+            "--symbols",
+            "btcusdt",
+            "--limit-events",
+            "10",
+            "--min-candidates",
+            "2",
+        ]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["events"][0]["event_slug"] == "bitcoin-above-on-may-3"
+    assert payload["events"][0]["candidate_count"] == 2

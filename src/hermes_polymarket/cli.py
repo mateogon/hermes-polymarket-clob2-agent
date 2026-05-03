@@ -11,6 +11,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+import time
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -1005,6 +1007,73 @@ def cmd_crypto_latency_universe(args: argparse.Namespace) -> int:
             gamma.close()
         return 0
 
+    if args.universe_action == "strike-events":
+        if not symbols:
+            print("strike-events requires at least one symbol")
+            return 2
+        gamma = GammaClient()
+        try:
+            events, _markets = fetch_gamma_universe(gamma, limit_events=args.limit_events, limit_markets=0)
+            payload = scan_market_universe(events=events, markets=[], symbols=symbols)
+            grouped: dict[tuple[str, str], dict[str, Any]] = {}
+            for row in payload.get("candidates", []):
+                if not isinstance(row, dict) or row.get("market_type") not in {"above_strike", "below_strike"}:
+                    continue
+                key = (str(row.get("event_slug") or ""), str(row.get("symbol") or ""))
+                if not key[0] or not key[1]:
+                    continue
+                group = grouped.setdefault(
+                    key,
+                    {
+                        "event_slug": key[0],
+                        "event_title": row.get("event_title"),
+                        "symbol": key[1],
+                        "candidate_count": 0,
+                        "best_score": 0.0,
+                        "market_types": {},
+                        "top_candidates": [],
+                    },
+                )
+                group["candidate_count"] += 1
+                group["best_score"] = max(float(group["best_score"]), float(row.get("score") or 0.0))
+                market_types = group["market_types"]
+                market_type = str(row.get("market_type"))
+                market_types[market_type] = int(market_types.get(market_type, 0)) + 1
+                group["top_candidates"].append(
+                    {
+                        "slug": row.get("slug"),
+                        "market_type": row.get("market_type"),
+                        "score": row.get("score"),
+                        "strike_price": row.get("strike_price"),
+                        "comparator": row.get("comparator"),
+                    }
+                )
+            events_out = []
+            for group in grouped.values():
+                if int(group["candidate_count"]) < args.min_candidates:
+                    continue
+                group["top_candidates"] = sorted(group["top_candidates"], key=lambda item: float(item.get("score") or 0.0), reverse=True)[:5]
+                group["recommended"] = float(group["best_score"]) >= args.min_score
+                events_out.append(group)
+            events_out.sort(key=lambda row: (bool(row["recommended"]), float(row["best_score"]), int(row["candidate_count"])), reverse=True)
+            print(
+                json.dumps(
+                    {
+                        "mode": "measurement_paper_only",
+                        "symbols": sorted(symbols),
+                        "scanned_events": len(events),
+                        "min_candidates": args.min_candidates,
+                        "min_score": args.min_score,
+                        "events": events_out[: args.limit],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        finally:
+            gamma.close()
+        return 0
+
     if args.universe_action == "import-best":
         if args.market_type != "up_down":
             print(json.dumps({"status": "unsupported_market_type", "reason": "import-best currently supports up_down only"}, indent=2, sort_keys=True))
@@ -1196,6 +1265,136 @@ def cmd_crypto_latency_source_health(_: argparse.Namespace) -> int:
     return 0
 
 
+def _rotate_strikes_for_watchlist(
+    db: Database,
+    settings: Any,
+    *,
+    symbol: str,
+    event_slug: str,
+    max_markets: int,
+    min_score: float,
+    duration_seconds: int,
+    clear_existing: bool,
+) -> tuple[dict[str, Any], int]:
+    from hermes_polymarket.data_sources.base import now_ms
+    from hermes_polymarket.crypto.market_universe import filter_universe_candidates, scan_market_universe
+    from hermes_polymarket.crypto.strike_candidate_selector import StrikeRotationConfig, score_strike_candidate
+    from hermes_polymarket.crypto.watchlist_seeding import current_reference_consensus
+    from hermes_polymarket.storage.crypto_watchlist import deactivate_crypto_watchlist_strikes, upsert_crypto_market_watchlist
+
+    symbol = symbol.lower()
+    price, sources, max_dev = current_reference_consensus(symbol)
+    gamma = GammaClient()
+    clob = ClobV2Client(settings)
+    try:
+        events = gamma.list_events(slug=event_slug, active="true", closed="false", limit=5)
+        if not events:
+            return (
+                {
+                    "mode": "measurement_paper_only",
+                    "status": "event_not_found",
+                    "symbol": symbol,
+                    "event_slug": event_slug,
+                    "imported": 0,
+                    "selected": [],
+                    "rejected": [],
+                },
+                2,
+            )
+        universe = scan_market_universe(events=[events[0]], markets=[], symbols={symbol})
+        candidates = [
+            row
+            for row in filter_universe_candidates(universe, market_type=None, min_score=0.0, limit=500)
+            if row.get("market_type") in {"above_strike", "below_strike"}
+        ]
+        config = StrikeRotationConfig(min_market_score=min_score)
+        scored: list[dict[str, Any]] = []
+        for candidate in candidates:
+            yes_book = no_book = None
+            try:
+                if candidate.get("yes_token_id"):
+                    yes_book = clob.get_orderbook(str(candidate["yes_token_id"]))
+                if candidate.get("no_token_id"):
+                    no_book = clob.get_orderbook(str(candidate["no_token_id"]))
+            except Exception:
+                yes_book = yes_book
+            scored.append(score_strike_candidate(candidate, current_price=price, yes_book=yes_book, no_book=no_book, config=config).to_dict())
+        scored.sort(key=lambda row: (bool(row["recommended"]), float(row["rotation_score"])), reverse=True)
+        selected = [row for row in scored if row["recommended"] and float(row["rotation_score"]) >= min_score][:max_markets]
+        rejected = [
+            {
+                "slug": row["slug"],
+                "score": row["rotation_score"],
+                "reason": ",".join(row.get("reject_reasons") or ["below_min_score"]),
+            }
+            for row in scored
+            if row not in selected
+        ][:20]
+        deactivated = deactivate_crypto_watchlist_strikes(db, symbol=symbol) if clear_existing else 0
+        now = now_ms()
+        window_start_ts = now // 1000
+        window_end_ts = window_start_ts + duration_seconds
+        imported = 0
+        for row in selected:
+            resolution_ts = None
+            if row.get("end_date"):
+                with contextlib.suppress(ValueError):
+                    parsed = datetime.fromisoformat(str(row["end_date"]).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    resolution_ts = int(parsed.timestamp())
+            upsert_crypto_market_watchlist(
+                db,
+                {
+                    "condition_id": row["condition_id"],
+                    "slug": row["slug"],
+                    "question": row["question"],
+                    "symbol": symbol,
+                    "yes_token_id": row["yes_token_id"],
+                    "no_token_id": row["no_token_id"],
+                    "up_token_id": "",
+                    "down_token_id": "",
+                    "market_type": row["market_type"],
+                    "strike_price": row.get("strike_price"),
+                    "comparator": row.get("comparator"),
+                    "resolution_ts": resolution_ts,
+                    "direction_map": {},
+                    "active": True,
+                    "discovered_at_ms": now,
+                    "end_ts_ms": window_end_ts * 1000,
+                    "raw": {
+                        "dynamic_strike_rotation": True,
+                        "reference_price": price,
+                        "window_start_ts": window_start_ts,
+                        "window_end_ts": window_end_ts,
+                        "consensus_sources": list(sources),
+                        "max_deviation_pct": max_dev,
+                        "rotation_score": row["rotation_score"],
+                        "rotation_reasons": row.get("rotation_reasons", []),
+                        "reject_reasons": row.get("reject_reasons", []),
+                    },
+                },
+            )
+            imported += 1
+        payload = {
+            "mode": "measurement_paper_only",
+            "status": "rotated" if selected else "no_usable_strikes",
+            "symbol": symbol,
+            "event_slug": event_slug,
+            "current_price": price,
+            "consensus_sources": list(sources),
+            "max_deviation_pct": max_dev,
+            "deactivated": deactivated,
+            "imported": imported,
+            "selected": selected,
+            "rejected": rejected,
+        }
+        return payload, 0 if selected else 2
+    finally:
+        gamma.close()
+        clob.close()
+
+
 def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
     from hermes_polymarket.data_sources.base import now_ms
     from hermes_polymarket.crypto.market_quality import watchlist_health_report
@@ -1350,114 +1549,128 @@ def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
             deleted = clear_crypto_market_watchlist(db)
             print(json.dumps({"mode": "measurement_paper_only", "status": "cleared", "deleted": deleted}, indent=2, sort_keys=True))
         elif args.watchlist_action == "rotate-strikes":
-            from datetime import datetime, timezone
+            payload, code = _rotate_strikes_for_watchlist(
+                db,
+                settings,
+                symbol=args.symbol,
+                event_slug=args.event_slug,
+                max_markets=args.max_markets,
+                min_score=args.min_score,
+                duration_seconds=args.duration_seconds,
+                clear_existing=args.clear_existing,
+            )
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return code
+        elif args.watchlist_action == "wait-for-strike":
+            from hermes_polymarket.crypto.l2_preflight import run_l2_preflight
 
-            from hermes_polymarket.crypto.market_universe import filter_universe_candidates, scan_market_universe
-            from hermes_polymarket.crypto.strike_candidate_selector import StrikeRotationConfig, score_strike_candidate
-            from hermes_polymarket.crypto.watchlist_seeding import current_reference_consensus
-
-            symbol = args.symbol.lower()
-            price, sources, max_dev = current_reference_consensus(symbol)
-            gamma = GammaClient()
-            clob = ClobV2Client(settings)
-            try:
-                events = gamma.list_events(slug=args.event_slug, active="true", closed="false", limit=5)
-                if not events:
-                    print(json.dumps({"mode": "measurement_paper_only", "status": "event_not_found", "event_slug": args.event_slug}, indent=2, sort_keys=True))
-                    return 2
-                universe = scan_market_universe(events=[events[0]], markets=[], symbols={symbol})
-                candidates = [
-                    row
-                    for row in filter_universe_candidates(universe, market_type=None, min_score=0.0, limit=500)
-                    if row.get("market_type") in {"above_strike", "below_strike"}
-                ]
-                config = StrikeRotationConfig(min_market_score=args.min_score)
-                scored: list[dict[str, Any]] = []
-                for candidate in candidates:
-                    yes_book = no_book = None
-                    try:
-                        if candidate.get("yes_token_id"):
-                            yes_book = clob.get_orderbook(str(candidate["yes_token_id"]))
-                        if candidate.get("no_token_id"):
-                            no_book = clob.get_orderbook(str(candidate["no_token_id"]))
-                    except Exception:
-                        yes_book = yes_book
-                    scored.append(score_strike_candidate(candidate, current_price=price, yes_book=yes_book, no_book=no_book, config=config).to_dict())
-                scored.sort(key=lambda row: (bool(row["recommended"]), float(row["rotation_score"])), reverse=True)
-                selected = [row for row in scored if row["recommended"] and float(row["rotation_score"]) >= args.min_score][: args.max_markets]
-                rejected = [
+            attempts: list[dict[str, Any]] = []
+            for attempt in range(1, args.max_attempts + 1):
+                payload, _code = _rotate_strikes_for_watchlist(
+                    db,
+                    settings,
+                    symbol=args.symbol,
+                    event_slug=args.event_slug,
+                    max_markets=args.max_markets,
+                    min_score=args.min_score,
+                    duration_seconds=args.duration_seconds,
+                    clear_existing=True,
+                )
+                attempts.append(
                     {
-                        "slug": row["slug"],
-                        "score": row["rotation_score"],
-                        "reason": ",".join(row.get("reject_reasons") or ["below_min_score"]),
+                        "attempt": attempt,
+                        "status": payload.get("status"),
+                        "imported": payload.get("imported", 0),
+                        "selected": payload.get("selected", []),
+                        "rejected": payload.get("rejected", [])[:5],
                     }
-                    for row in scored
-                    if row not in selected
-                ][:20]
-                deactivated = deactivate_crypto_watchlist_strikes(db, symbol=symbol) if args.clear_existing else 0
-                now = now_ms()
-                window_start_ts = now // 1000
-                window_end_ts = window_start_ts + args.duration_seconds
-                imported = 0
-                for row in selected:
-                    resolution_ts = None
-                    if row.get("end_date"):
-                        with contextlib.suppress(ValueError):
-                            parsed = datetime.fromisoformat(str(row["end_date"]).replace("Z", "+00:00"))
-                            if parsed.tzinfo is None:
-                                parsed = parsed.replace(tzinfo=timezone.utc)
-                            resolution_ts = int(parsed.timestamp())
-                    upsert_crypto_market_watchlist(
-                        db,
-                        {
-                            "condition_id": row["condition_id"],
-                            "slug": row["slug"],
-                            "question": row["question"],
-                            "symbol": symbol,
-                            "yes_token_id": row["yes_token_id"],
-                            "no_token_id": row["no_token_id"],
-                            "up_token_id": "",
-                            "down_token_id": "",
-                            "market_type": row["market_type"],
-                            "strike_price": row.get("strike_price"),
-                            "comparator": row.get("comparator"),
-                            "resolution_ts": resolution_ts,
-                            "direction_map": {},
-                            "active": True,
-                            "discovered_at_ms": now,
-                            "end_ts_ms": window_end_ts * 1000,
-                            "raw": {
-                                "dynamic_strike_rotation": True,
-                                "reference_price": price,
-                                "window_start_ts": window_start_ts,
-                                "window_end_ts": window_end_ts,
-                                "consensus_sources": list(sources),
-                                "max_deviation_pct": max_dev,
-                                "rotation_score": row["rotation_score"],
-                                "rotation_reasons": row.get("rotation_reasons", []),
-                                "reject_reasons": row.get("reject_reasons", []),
+                )
+                if int(payload.get("imported") or 0) > 0:
+                    preflight: dict[str, Any] | None = None
+                    preflight_usable = None
+                    if args.run_preflight:
+                        preflight = asyncio.run(
+                            run_l2_preflight(
+                                db=db,
+                                settings=settings,
+                                symbol=args.symbol,
+                                seconds=args.preflight_seconds,
+                                require_rest_book=False,
+                                require_ws_book=False,
+                                require_bbo=False,
+                            )
+                        )
+                        markets = preflight.get("markets", []) if isinstance(preflight, dict) else []
+                        preflight_usable = bool(markets) and all(market.get("recommended_action") == "usable" for market in markets)
+                    smoke: dict[str, Any] | None = None
+                    smoke_run_id = None
+                    if args.run_smoke:
+                        if args.run_preflight and not preflight_usable:
+                            smoke = {"status": "skipped", "reason": "preflight_not_usable"}
+                        else:
+                            env = dict(os.environ)
+                            env["HERMES_DATABASE_PATH"] = str(settings.database_path)
+                            command = [
+                                sys.executable,
+                                "-m",
+                                "hermes_polymarket.cli",
+                                "crypto-paper",
+                                "watch-v2",
+                                "--seconds",
+                                str(args.smoke_seconds),
+                                "--symbols",
+                                args.symbol,
+                                "--from-watchlist",
+                                "--close-open-on-end",
+                            ]
+                            if args.write_artifacts:
+                                command.append("--write-artifacts")
+                            completed = subprocess.run(command, env=env, capture_output=True, text=True, check=False)
+                            smoke = {
+                                "status": "completed" if completed.returncode == 0 else "failed",
+                                "returncode": completed.returncode,
+                            }
+                            with contextlib.suppress(json.JSONDecodeError):
+                                parsed = json.loads(completed.stdout)
+                                smoke["output"] = parsed
+                                smoke_run_id = (parsed.get("summary") or {}).get("run_id")
+                            if completed.returncode != 0:
+                                smoke["stderr"] = completed.stderr[-2000:]
+                    print(
+                        json.dumps(
+                            {
+                                "mode": "measurement_paper_only",
+                                "status": "found",
+                                "attempts": attempt,
+                                "imported": payload.get("imported", 0),
+                                "selected": payload.get("selected", []),
+                                "preflight": preflight,
+                                "preflight_usable": preflight_usable,
+                                "smoke": smoke,
+                                "smoke_run_id": smoke_run_id,
+                                "attempt_log": attempts,
                             },
-                        },
+                            indent=2,
+                            sort_keys=True,
+                        )
                     )
-                    imported += 1
-                payload = {
-                    "mode": "measurement_paper_only",
-                    "status": "rotated" if selected else "no_usable_strikes",
-                    "symbol": symbol,
-                    "event_slug": args.event_slug,
-                    "current_price": price,
-                    "consensus_sources": list(sources),
-                    "max_deviation_pct": max_dev,
-                    "deactivated": deactivated,
-                    "imported": imported,
-                    "selected": selected,
-                    "rejected": rejected,
-                }
-                print(json.dumps(payload, indent=2, sort_keys=True))
-                return 0 if selected else 2
-            finally:
-                gamma.close()
-                clob.close()
+                    return 0
+                if attempt < args.max_attempts and args.poll_seconds > 0:
+                    time.sleep(args.poll_seconds)
+            print(
+                json.dumps(
+                    {
+                        "mode": "measurement_paper_only",
+                        "status": "not_found",
+                        "attempts": args.max_attempts,
+                        "message": "No healthy strike candidates met min_score.",
+                        "attempt_log": attempts,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 2
         elif args.watchlist_action == "health":
             print(json.dumps(watchlist_health_report(db, symbol=args.symbol, active_only=not args.all, limit=args.limit), indent=2, sort_keys=True))
         elif args.watchlist_action == "disable":
@@ -2692,6 +2905,13 @@ def build_parser() -> argparse.ArgumentParser:
     universe_strike.add_argument("--current-price-source", choices=["consensus"], default="consensus")
     universe_strike.add_argument("--auto-pick-nearest", action="store_true")
     universe_strike.set_defaults(func=cmd_crypto_latency_universe)
+    universe_strike_events = universe_sub.add_parser("strike-events")
+    universe_strike_events.add_argument("--symbols", default="btcusdt,ethusdt,solusdt,xrpusdt")
+    universe_strike_events.add_argument("--limit-events", type=int, default=1000)
+    universe_strike_events.add_argument("--min-candidates", type=int, default=3)
+    universe_strike_events.add_argument("--min-score", type=float, default=0.75)
+    universe_strike_events.add_argument("--limit", type=int, default=20)
+    universe_strike_events.set_defaults(func=cmd_crypto_latency_universe)
     universe_import_best = universe_sub.add_parser("import-best")
     universe_import_best.add_argument("--file", default="artifacts/universe/latest.json")
     universe_import_best.add_argument("--market-type", choices=["up_down", "above_strike", "below_strike", "multi_strike_event", "unsupported"], default="up_down")
@@ -2744,6 +2964,19 @@ def build_parser() -> argparse.ArgumentParser:
     watchlist_rotate_strikes.add_argument("--min-score", type=float, default=0.75)
     watchlist_rotate_strikes.add_argument("--duration-seconds", type=int, default=900)
     watchlist_rotate_strikes.add_argument("--clear-existing", action="store_true")
+    watchlist_wait_strike = watchlist_sub.add_parser("wait-for-strike")
+    watchlist_wait_strike.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    watchlist_wait_strike.add_argument("--event-slug", required=True)
+    watchlist_wait_strike.add_argument("--max-markets", type=int, default=2)
+    watchlist_wait_strike.add_argument("--min-score", type=float, default=0.75)
+    watchlist_wait_strike.add_argument("--duration-seconds", type=int, default=900)
+    watchlist_wait_strike.add_argument("--poll-seconds", type=int, default=300)
+    watchlist_wait_strike.add_argument("--max-attempts", type=int, default=12)
+    watchlist_wait_strike.add_argument("--run-preflight", action="store_true")
+    watchlist_wait_strike.add_argument("--preflight-seconds", type=int, default=30)
+    watchlist_wait_strike.add_argument("--run-smoke", action="store_true")
+    watchlist_wait_strike.add_argument("--smoke-seconds", type=int, default=300)
+    watchlist_wait_strike.add_argument("--write-artifacts", action="store_true")
     watchlist_import = watchlist_sub.add_parser("import")
     watchlist_import.add_argument("--file", required=True)
     watchlist_health = watchlist_sub.add_parser("health")
