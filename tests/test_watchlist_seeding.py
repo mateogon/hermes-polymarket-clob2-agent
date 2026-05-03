@@ -67,6 +67,100 @@ def test_seed_current_window_from_slug_resolves_gamma_and_reference():
     assert set(seed.consensus_sources) == {"binance_rest", "coinbase_rest", "kraken_rest"}
 
 
+def test_seed_current_window_falls_back_to_event_slug_with_single_market():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "gamma-api.polymarket.com" and request.url.path == "/markets":
+            return _json_response([])
+        if request.url.host == "gamma-api.polymarket.com" and request.url.path == "/events":
+            return _json_response(
+                [
+                    {
+                        "slug": "bitcoin-event",
+                        "markets": [
+                            {
+                                "conditionId": "condition",
+                                "slug": "bitcoin-up-or-down-market",
+                                "question": "Bitcoin Up or Down",
+                                "clobTokenIds": '["yes-token", "no-token"]',
+                                "active": True,
+                                "closed": False,
+                            }
+                        ],
+                    }
+                ]
+            )
+        if "binance" in request.url.host:
+            return _json_response({"price": "100.0"})
+        if "coinbase" in request.url.host:
+            return _json_response({"price": "100.02"})
+        if "kraken" in request.url.host:
+            return _json_response({"result": {"XXBTZUSD": {"c": ["100.01", "1"]}}})
+        raise AssertionError(str(request.url))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    seed = seed_current_window_from_slug(
+        slug="bitcoin-event",
+        symbol="btcusdt",
+        yes_direction="up",
+        duration_seconds=900,
+        now_ts=123,
+        http_client=client,
+    )
+
+    assert seed.slug == "bitcoin-up-or-down-market"
+    assert seed.condition_id == "condition"
+    assert seed.reference_price == 100.01
+
+
+def test_seed_current_window_rejects_ambiguous_event_slug():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "gamma-api.polymarket.com" and request.url.path == "/markets":
+            return _json_response([])
+        if request.url.host == "gamma-api.polymarket.com" and request.url.path == "/events":
+            return _json_response(
+                [
+                    {
+                        "slug": "bitcoin-event",
+                        "markets": [
+                            {
+                                "conditionId": "c1",
+                                "slug": "bitcoin-up-or-down-one",
+                                "question": "Bitcoin Up or Down",
+                                "clobTokenIds": '["yes-1", "no-1"]',
+                                "active": True,
+                                "closed": False,
+                            },
+                            {
+                                "conditionId": "c2",
+                                "slug": "bitcoin-up-or-down-two",
+                                "question": "Bitcoin Up or Down",
+                                "clobTokenIds": '["yes-2", "no-2"]',
+                                "active": True,
+                                "closed": False,
+                            },
+                        ],
+                    }
+                ]
+            )
+        raise AssertionError(str(request.url))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        seed_current_window_from_slug(
+            slug="bitcoin-event",
+            symbol="btcusdt",
+            yes_direction="up",
+            duration_seconds=900,
+            now_ts=123,
+            http_client=client,
+        )
+    except ValueError as exc:
+        assert "ambiguous" in str(exc)
+        assert "bitcoin-up-or-down-one" in str(exc)
+    else:
+        raise AssertionError("ambiguous event slug should be rejected")
+
+
 def test_seed_current_window_rejects_closed_gamma_market():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "gamma-api.polymarket.com":

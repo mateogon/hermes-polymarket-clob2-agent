@@ -87,19 +87,66 @@ def _token_ids(market: dict[str, Any]) -> tuple[str, str] | None:
     return None
 
 
+def _is_open_market(market: dict[str, Any]) -> bool:
+    return bool(market.get("active", True)) and not bool(market.get("closed"))
+
+
+def _event_markets(event: dict[str, Any]) -> list[dict[str, Any]]:
+    markets = event.get("markets")
+    if isinstance(markets, list):
+        return [market for market in markets if isinstance(market, dict)]
+    return []
+
+
+def _compatible_event_markets(event: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for market in _event_markets(event):
+        if not _is_open_market(market):
+            continue
+        slug = str(market.get("slug") or "")
+        question = str(market.get("question") or market.get("title") or "")
+        if market_window_from_gamma_market(market) is not None or infer_crypto_symbol(f"{slug} {question}"):
+            candidates.append(market)
+    return candidates
+
+
 def fetch_gamma_market_by_slug(slug: str, *, http_client: httpx.Client | None = None) -> dict[str, Any]:
+    """Fetch a Gamma market by market slug, falling back to event slug.
+
+    Polymarket UI URLs often point to event slugs. Gamma `/markets?slug=...`
+    only resolves direct market slugs, while `/events?slug=...` returns the
+    associated markets. We accept an event slug only when it maps to exactly one
+    active/open compatible crypto market; multi-market events require an exact
+    market slug so direction/reference are not guessed across strikes.
+    """
+
     close = http_client is None
     client = http_client or httpx.Client(timeout=15.0)
     try:
         response = client.get(f"{GAMMA_API}/markets", params={"slug": slug})
         response.raise_for_status()
         rows = response.json()
-        if not isinstance(rows, list) or not rows:
-            raise ValueError(f"Gamma returned no market for slug: {slug}")
-        market = rows[0]
-        if not isinstance(market, dict):
-            raise ValueError(f"Gamma market payload is not an object for slug: {slug}")
-        return market
+        if isinstance(rows, list) and rows:
+            market = rows[0]
+            if not isinstance(market, dict):
+                raise ValueError(f"Gamma market payload is not an object for slug: {slug}")
+            return market
+
+        event_response = client.get(f"{GAMMA_API}/events", params={"slug": slug, "active": "true", "closed": "false"})
+        event_response.raise_for_status()
+        events = event_response.json()
+        if not isinstance(events, list) or not events:
+            raise ValueError(f"Gamma returned no market or event for slug: {slug}")
+        event = events[0]
+        if not isinstance(event, dict):
+            raise ValueError(f"Gamma event payload is not an object for slug: {slug}")
+        candidates = _compatible_event_markets(event)
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            slugs = [str(market.get("slug") or "") for market in candidates[:10]]
+            raise ValueError(f"Gamma event slug is ambiguous; pass a market slug instead: {slug}; candidates={slugs}")
+        raise ValueError(f"Gamma event has no active/open compatible crypto markets for slug: {slug}")
     finally:
         if close:
             client.close()
