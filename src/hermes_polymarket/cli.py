@@ -1696,15 +1696,25 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                     await asyncio.gather(*tasks)
 
             summary_dict = summary.to_dict()
+            reconciliation: dict[str, Any] = {}
+            if args.close_open_on_end:
+                from hermes_polymarket.forward_paper.reconciliation import reconcile_open_positions
+
+                reconciliation = reconcile_open_positions(db, run_id=summary.run_id, policy="mark_to_last_bid")
+                summary_dict["positions_closed"] = int(summary_dict.get("positions_closed", 0)) + int(reconciliation["closed"])
+                summary_dict["run_end_reconciliation"] = reconciliation
             position_report = forward_position_report(db, run_id=summary.run_id, include_fixture=args.fixture)
             warnings = forward_paper_quality_warnings(
                 signals=summary.signals_generated,
-                closed_positions=summary.positions_closed,
+                closed_positions=position_report["closed"],
                 min_move_pct=args.min_move_pct,
                 min_strategy_threshold_pct=args.min_strategy_threshold_pct,
             )
             if args.seconds != seconds:
                 warnings.append("duration_capped_by_config")
+            for warning in reconciliation.get("warnings", []):
+                if warning not in warnings:
+                    warnings.append(warning)
             quality = {
                 "warnings": warnings,
                 "threshold_calibration": summary.threshold_calibration,
@@ -1766,6 +1776,7 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                 "rest_book_seed": rest_seed,
                 "summary": summary_dict,
                 "position_report": position_report,
+                "reconciliation": reconciliation,
                 "quality": quality,
                 "artifacts": artifacts,
                 "latency_report": crypto_latency_report(db),
@@ -1828,6 +1839,25 @@ def cmd_crypto_paper_report(args: argparse.Namespace) -> int:
     db.init_schema(settings.initial_bankroll)
     try:
         print(json.dumps(forward_run_report(db, run_id=args.run_id, include_fixture=args.include_fixture), indent=2, sort_keys=True))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_crypto_paper_reconcile_open(args: argparse.Namespace) -> int:
+    from hermes_polymarket.forward_paper.reconciliation import reconcile_open_positions
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        print(
+            json.dumps(
+                reconcile_open_positions(db, run_id=args.run_id, policy=args.policy),
+                indent=2,
+                sort_keys=True,
+            )
+        )
     finally:
         db.close()
     return 0
@@ -2568,6 +2598,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_watch.add_argument("--use-fair-value", action="store_true")
     crypto_paper_watch.add_argument("--fair-value-min-edge", type=float, default=0.03)
     crypto_paper_watch.add_argument("--seed-rest-books", action="store_true")
+    crypto_paper_watch.add_argument("--close-open-on-end", action="store_true")
     crypto_paper_watch.add_argument(
         "--healthy-only",
         action="store_true",
@@ -2604,6 +2635,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_watch_v2.add_argument("--use-fair-value", action="store_true", default=True)
     crypto_paper_watch_v2.add_argument("--fair-value-min-edge", type=float, default=0.03)
     crypto_paper_watch_v2.add_argument("--seed-rest-books", action="store_true", default=True)
+    crypto_paper_watch_v2.add_argument("--close-open-on-end", action="store_true")
     crypto_paper_watch_v2.set_defaults(func=cmd_crypto_paper_watch_v2)
     crypto_paper_positions = crypto_paper_sub.add_parser("positions")
     crypto_paper_positions.add_argument("--open", action="store_true")
@@ -2617,6 +2649,10 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_report.add_argument("--include-fixture", action="store_true")
     crypto_paper_report.add_argument("--aggregate", action="store_true")
     crypto_paper_report.set_defaults(func=cmd_crypto_paper_report)
+    crypto_paper_reconcile = crypto_paper_sub.add_parser("reconcile-open")
+    crypto_paper_reconcile.add_argument("--run-id", required=True)
+    crypto_paper_reconcile.add_argument("--policy", choices=("mark_to_last_bid", "keep_open"), default="mark_to_last_bid")
+    crypto_paper_reconcile.set_defaults(func=cmd_crypto_paper_reconcile_open)
     crypto_paper_signals = crypto_paper_sub.add_parser("signals")
     crypto_paper_signals.add_argument("--run-id", default=None)
     crypto_paper_signals.add_argument("--last", type=int, default=50)

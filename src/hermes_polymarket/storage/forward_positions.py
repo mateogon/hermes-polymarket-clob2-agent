@@ -190,6 +190,10 @@ def forward_run_report(db: Database, *, run_id: str | None = None, include_fixtu
     positions = forward_positions(db, run_id=run_id, include_fixture=include_fixture, limit=10_000)
     closed = [row for row in positions if row["status"] == "closed"]
     open_ = [row for row in positions if row["status"] == "open"]
+    mark_to_market = [row for row in closed if row.get("exit_reason") == "run_end_mark"]
+    warnings: list[str] = []
+    if mark_to_market:
+        warnings.append("mark_to_market_exit_not_actual_fill")
     by_action_reason: dict[str, int] = {}
     for signal in signals:
         key = f"{signal.get('final_action')}:{signal.get('risk_reason')}"
@@ -204,9 +208,11 @@ def forward_run_report(db: Database, *, run_id: str | None = None, include_fixtu
         "positions": len(positions),
         "open": len(open_),
         "closed": len(closed),
+        "mark_to_market_positions": len(mark_to_market),
         "net_pnl": pnl,
         "win_rate": sum(1 for row in closed if float(row["net_pnl"] or 0.0) > 0) / len(closed) if closed else 0.0,
         "by_action_reason": by_action_reason,
+        "quality_warnings": warnings,
     }
 
 
