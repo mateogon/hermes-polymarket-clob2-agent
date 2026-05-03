@@ -86,6 +86,20 @@ def set_crypto_market_watchlist_active(db: Database, *, condition_id: str, activ
     return int(cur.rowcount)
 
 
+def deactivate_crypto_watchlist_strikes(db: Database, *, symbol: str) -> int:
+    cur = db.conn.execute(
+        """
+        UPDATE crypto_market_watchlist
+        SET active = 0
+        WHERE symbol = ?
+          AND market_type IN ('above_strike', 'below_strike')
+        """,
+        (symbol.lower(),),
+    )
+    db.conn.commit()
+    return int(cur.rowcount)
+
+
 def set_crypto_market_reference(
     db: Database,
     *,

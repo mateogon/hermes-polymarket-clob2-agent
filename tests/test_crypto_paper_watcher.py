@@ -220,6 +220,7 @@ def test_crypto_paper_watcher_v2_rejects_market_score_below_threshold(tmp_path):
         assert signals[0]["final_action"] == "market_score_rejected"
         payload = json.loads(signals[0]["payload_json"])
         assert payload["market_score"]["score"] < payload["market_score"]["min_required"]
+        assert payload["stale_quote"]["reason"] == "missing_l2_context"
 
     asyncio.run(run())
 

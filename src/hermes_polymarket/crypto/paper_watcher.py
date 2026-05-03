@@ -256,6 +256,9 @@ def _v2_signal_diagnostics(
         decision = "allowed" if selected_edge is not None and float(selected_edge) >= min_edge else "edge_below_min"
 
     stale_dict = stale.to_dict() if stale is not None else {}
+    stale_reason = stale_dict.get("reason")
+    if stale_reason is None:
+        stale_reason = "missing_l2_context" if market is not None else "disabled"
     score = market_score or {}
     return {
         "strategy_version": "stale_fair_value_v2",
@@ -279,9 +282,9 @@ def _v2_signal_diagnostics(
             "decision": decision,
         },
         "stale_quote": {
-            "enabled": stale is not None,
-            "allowed": stale_dict.get("allowed"),
-            "reason": stale_dict.get("reason"),
+            "enabled": True,
+            "allowed": stale_dict.get("allowed", False),
+            "reason": stale_reason,
             "bbo_change_cents": stale_dict.get("bbo_change_cents"),
             "max_reprice_cents": None,
             "stale_window_ms": stale_dict.get("stale_window_ms"),

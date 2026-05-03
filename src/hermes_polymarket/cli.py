@@ -1202,6 +1202,7 @@ def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
     from hermes_polymarket.storage.crypto_watchlist import (
         clear_crypto_market_watchlist,
         crypto_market_watchlist,
+        deactivate_crypto_watchlist_strikes,
         set_crypto_market_reference,
         set_crypto_market_watchlist_active,
         upsert_crypto_market_watchlist,
@@ -1348,6 +1349,115 @@ def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
         elif args.watchlist_action == "clear":
             deleted = clear_crypto_market_watchlist(db)
             print(json.dumps({"mode": "measurement_paper_only", "status": "cleared", "deleted": deleted}, indent=2, sort_keys=True))
+        elif args.watchlist_action == "rotate-strikes":
+            from datetime import datetime, timezone
+
+            from hermes_polymarket.crypto.market_universe import filter_universe_candidates, scan_market_universe
+            from hermes_polymarket.crypto.strike_candidate_selector import StrikeRotationConfig, score_strike_candidate
+            from hermes_polymarket.crypto.watchlist_seeding import current_reference_consensus
+
+            symbol = args.symbol.lower()
+            price, sources, max_dev = current_reference_consensus(symbol)
+            gamma = GammaClient()
+            clob = ClobV2Client(settings)
+            try:
+                events = gamma.list_events(slug=args.event_slug, active="true", closed="false", limit=5)
+                if not events:
+                    print(json.dumps({"mode": "measurement_paper_only", "status": "event_not_found", "event_slug": args.event_slug}, indent=2, sort_keys=True))
+                    return 2
+                universe = scan_market_universe(events=[events[0]], markets=[], symbols={symbol})
+                candidates = [
+                    row
+                    for row in filter_universe_candidates(universe, market_type=None, min_score=0.0, limit=500)
+                    if row.get("market_type") in {"above_strike", "below_strike"}
+                ]
+                config = StrikeRotationConfig(min_market_score=args.min_score)
+                scored: list[dict[str, Any]] = []
+                for candidate in candidates:
+                    yes_book = no_book = None
+                    try:
+                        if candidate.get("yes_token_id"):
+                            yes_book = clob.get_orderbook(str(candidate["yes_token_id"]))
+                        if candidate.get("no_token_id"):
+                            no_book = clob.get_orderbook(str(candidate["no_token_id"]))
+                    except Exception:
+                        yes_book = yes_book
+                    scored.append(score_strike_candidate(candidate, current_price=price, yes_book=yes_book, no_book=no_book, config=config).to_dict())
+                scored.sort(key=lambda row: (bool(row["recommended"]), float(row["rotation_score"])), reverse=True)
+                selected = [row for row in scored if row["recommended"] and float(row["rotation_score"]) >= args.min_score][: args.max_markets]
+                rejected = [
+                    {
+                        "slug": row["slug"],
+                        "score": row["rotation_score"],
+                        "reason": ",".join(row.get("reject_reasons") or ["below_min_score"]),
+                    }
+                    for row in scored
+                    if row not in selected
+                ][:20]
+                deactivated = deactivate_crypto_watchlist_strikes(db, symbol=symbol) if args.clear_existing else 0
+                now = now_ms()
+                window_start_ts = now // 1000
+                window_end_ts = window_start_ts + args.duration_seconds
+                imported = 0
+                for row in selected:
+                    resolution_ts = None
+                    if row.get("end_date"):
+                        with contextlib.suppress(ValueError):
+                            parsed = datetime.fromisoformat(str(row["end_date"]).replace("Z", "+00:00"))
+                            if parsed.tzinfo is None:
+                                parsed = parsed.replace(tzinfo=timezone.utc)
+                            resolution_ts = int(parsed.timestamp())
+                    upsert_crypto_market_watchlist(
+                        db,
+                        {
+                            "condition_id": row["condition_id"],
+                            "slug": row["slug"],
+                            "question": row["question"],
+                            "symbol": symbol,
+                            "yes_token_id": row["yes_token_id"],
+                            "no_token_id": row["no_token_id"],
+                            "up_token_id": "",
+                            "down_token_id": "",
+                            "market_type": row["market_type"],
+                            "strike_price": row.get("strike_price"),
+                            "comparator": row.get("comparator"),
+                            "resolution_ts": resolution_ts,
+                            "direction_map": {},
+                            "active": True,
+                            "discovered_at_ms": now,
+                            "end_ts_ms": window_end_ts * 1000,
+                            "raw": {
+                                "dynamic_strike_rotation": True,
+                                "reference_price": price,
+                                "window_start_ts": window_start_ts,
+                                "window_end_ts": window_end_ts,
+                                "consensus_sources": list(sources),
+                                "max_deviation_pct": max_dev,
+                                "rotation_score": row["rotation_score"],
+                                "rotation_reasons": row.get("rotation_reasons", []),
+                                "reject_reasons": row.get("reject_reasons", []),
+                            },
+                        },
+                    )
+                    imported += 1
+                payload = {
+                    "mode": "measurement_paper_only",
+                    "status": "rotated" if selected else "no_usable_strikes",
+                    "symbol": symbol,
+                    "event_slug": args.event_slug,
+                    "current_price": price,
+                    "consensus_sources": list(sources),
+                    "max_deviation_pct": max_dev,
+                    "deactivated": deactivated,
+                    "imported": imported,
+                    "selected": selected,
+                    "rejected": rejected,
+                }
+                print(json.dumps(payload, indent=2, sort_keys=True))
+                return 0 if selected else 2
+            finally:
+                gamma.close()
+                clob.close()
         elif args.watchlist_action == "health":
             print(json.dumps(watchlist_health_report(db, symbol=args.symbol, active_only=not args.all, limit=args.limit), indent=2, sort_keys=True))
         elif args.watchlist_action == "disable":
@@ -2627,6 +2737,13 @@ def build_parser() -> argparse.ArgumentParser:
     watchlist_add_current.add_argument("--min-sources", type=int, default=2)
     watchlist_add_current.add_argument("--max-deviation-pct", type=float, default=0.25)
     watchlist_clear = watchlist_sub.add_parser("clear")
+    watchlist_rotate_strikes = watchlist_sub.add_parser("rotate-strikes")
+    watchlist_rotate_strikes.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    watchlist_rotate_strikes.add_argument("--event-slug", required=True)
+    watchlist_rotate_strikes.add_argument("--max-markets", type=int, default=2)
+    watchlist_rotate_strikes.add_argument("--min-score", type=float, default=0.75)
+    watchlist_rotate_strikes.add_argument("--duration-seconds", type=int, default=900)
+    watchlist_rotate_strikes.add_argument("--clear-existing", action="store_true")
     watchlist_import = watchlist_sub.add_parser("import")
     watchlist_import.add_argument("--file", required=True)
     watchlist_health = watchlist_sub.add_parser("health")

@@ -165,3 +165,76 @@ def test_universe_strike_candidates_accepts_plan_7_26_args(monkeypatch, capsys):
     assert payload["candidates"][0]["rest_book_ok"] is True
     assert payload["candidates"][0]["l2_quality"]["all_allowed"] is True
     assert payload["candidates"][0]["recommended"] is True
+
+
+def test_rotate_strikes_imports_top_candidate_and_clears_old(monkeypatch, tmp_path, capsys):
+    class FakeGamma:
+        def list_events(self, **_kwargs):
+            return [
+                {
+                    "slug": "bitcoin-above-on-may-3",
+                    "title": "Bitcoin above on May 3",
+                    "markets": [
+                        _market(
+                            conditionId="old-condition",
+                            question="Will Bitcoin be above $76,000 on May 3?",
+                            slug="bitcoin-above-76k-on-may-3",
+                            outcomes='["Yes", "No"]',
+                            clobTokenIds='["old-yes", "old-no"]',
+                        ),
+                        _market(
+                            conditionId="new-condition",
+                            question="Will Bitcoin be above $78,000 on May 3?",
+                            slug="bitcoin-above-78k-on-may-3",
+                            outcomes='["Yes", "No"]',
+                            clobTokenIds='["yes-token", "no-token"]',
+                        ),
+                    ],
+                }
+            ]
+
+        def close(self):
+            pass
+
+    class FakeClob:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_orderbook(self, token_id):
+            if token_id.startswith("old"):
+                return OrderBook(token_id=token_id, bids=(OrderBookLevel(0.98, 100),), asks=(OrderBookLevel(0.984, 100),))
+            return OrderBook(token_id=token_id, bids=(OrderBookLevel(0.49, 100),), asks=(OrderBookLevel(0.50, 100),))
+
+        def close(self):
+            pass
+
+    monkeypatch.setenv("HERMES_DATABASE_PATH", str(tmp_path / "x.sqlite3"))
+    monkeypatch.setattr("hermes_polymarket.cli.GammaClient", FakeGamma)
+    monkeypatch.setattr("hermes_polymarket.cli.ClobV2Client", FakeClob)
+    monkeypatch.setattr("hermes_polymarket.crypto.watchlist_seeding.current_reference_consensus", lambda _symbol: (78500.0, ("binance", "coinbase"), 0.01))
+
+    assert main(
+        [
+            "crypto-latency",
+            "watchlist",
+            "rotate-strikes",
+            "--symbol",
+            "btcusdt",
+            "--event-slug",
+            "bitcoin-above-on-may-3",
+            "--max-markets",
+            "1",
+            "--min-score",
+            "0.75",
+            "--clear-existing",
+        ]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected"][0]["slug"] == "bitcoin-above-78k-on-may-3"
+    assert payload["imported"] == 1
+
+    assert main(["crypto-latency", "watchlist"]) == 0
+    watchlist = json.loads(capsys.readouterr().out)["watchlist"]
+    assert watchlist[0]["slug"] == "bitcoin-above-78k-on-may-3"
+    assert watchlist[0]["strike_price"] == 78000.0
+    assert '"reference_price": 78500.0' in watchlist[0]["raw_json"]

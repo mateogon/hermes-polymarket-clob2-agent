@@ -1,0 +1,22 @@
+strike_rotation:
+  symbols:
+    - btcusdt
+
+  event_slugs:
+    btcusdt:
+      - bitcoin-above-on-may-3
+
+  candidate_filters:
+    min_distance_pct: 0.10
+    max_distance_pct: 2.50
+    min_market_score: 0.75
+    min_best_ask: 0.05
+    max_best_ask: 0.95
+    min_depth_within_2pct_usd: 10
+    min_depth_within_5pct_usd: 25
+    require_two_sided_book: true
+
+  selection:
+    max_markets_per_symbol: 2
+    prefer_near_atm: true
+    reject_extreme: true
