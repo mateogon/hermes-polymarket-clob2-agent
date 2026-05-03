@@ -2141,6 +2141,220 @@ def cmd_crypto_latency_opportunities(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_multi_strike(args: argparse.Namespace) -> int:
+    if args.multi_strike_command == "paper-watch":
+        from hermes_polymarket.crypto.multi_strike_paper import MultiStrikePaperConfig, run_multi_strike_paper_watch
+
+        settings = _settings()
+        db = Database(settings.database_path)
+        db.init_schema(settings.initial_bankroll)
+        try:
+            config = MultiStrikePaperConfig(
+                event_slug=args.event_slug,
+                symbol=args.symbol,
+                amount_usd=args.amount,
+                edge_threshold=args.edge_threshold,
+                exit_edge_threshold=args.exit_edge_threshold,
+                seconds=args.seconds,
+                mark_interval_seconds=args.mark_interval_seconds,
+                annualized_vol=args.annualized_vol,
+                min_ask=args.min_ask,
+                max_ask=args.max_ask,
+                take_profit_cents=args.take_profit_cents,
+                stop_loss_cents=args.stop_loss_cents,
+                timeout_seconds=args.timeout_seconds,
+                close_open_on_end=args.close_open_on_end,
+                max_positions=1,
+            )
+            payload = run_multi_strike_paper_watch(db=db, settings=settings, config=config)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if payload.get("status") in {"completed", "no_candidate_opened"} else 2
+        finally:
+            db.close()
+
+    if args.multi_strike_command == "report":
+        from hermes_polymarket.storage.forward_positions import forward_run_report
+
+        settings = _settings()
+        db = Database(settings.database_path)
+        db.init_schema(settings.initial_bankroll)
+        try:
+            print(json.dumps(forward_run_report(db, run_id=args.run_id, include_fixture=False), indent=2, sort_keys=True))
+            return 0
+        finally:
+            db.close()
+
+    if args.multi_strike_command == "calibrate":
+        from hermes_polymarket.crypto.market_quality import evaluate_market_quality
+        from hermes_polymarket.crypto.market_universe import filter_universe_candidates, scan_market_universe
+        from hermes_polymarket.crypto.multi_strike_fair_value import fair_value_target_hit
+        from hermes_polymarket.crypto.multi_strike_market import parse_multi_strike_target
+        from hermes_polymarket.crypto.watchlist_seeding import current_reference_consensus
+
+        vols = [float(value) for value in args.vol_grid.split(",") if value.strip()]
+        edges = [float(value) for value in args.edge_grid.split(",") if value.strip()]
+        gamma = GammaClient()
+        settings = _settings()
+        clob = ClobV2Client(settings)
+        try:
+            events = gamma.list_events(slug=args.event_slug, active="true", closed="false", limit=5)
+            if not events:
+                print(json.dumps({"status": "event_not_found", "event_slug": args.event_slug}, indent=2, sort_keys=True))
+                return 2
+            current_price, sources, max_dev = current_reference_consensus(args.symbol)
+            universe = scan_market_universe(events=[events[0]], markets=[], symbols={args.symbol})
+            now = datetime.now(timezone.utc)
+            candidates = []
+            for row in filter_universe_candidates(universe, market_type="multi_strike_event", min_score=0.0, limit=500):
+                if not row.get("active") or row.get("closed") or not row.get("yes_token_id"):
+                    continue
+                target = parse_multi_strike_target(f"{row.get('question') or ''} {row.get('slug') or ''}", current_price=current_price)
+                target_price = row.get("strike_price") or (target.target_price if target is not None else None)
+                if target_price is None:
+                    continue
+                seconds_to_expiry = 1.0
+                if row.get("end_date"):
+                    with contextlib.suppress(ValueError):
+                        parsed = datetime.fromisoformat(str(row["end_date"]).replace("Z", "+00:00"))
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        seconds_to_expiry = max(1.0, (parsed - now).total_seconds())
+                try:
+                    book = clob.get_orderbook(str(row["yes_token_id"]))
+                    quality = evaluate_market_quality(book).to_dict()
+                except Exception as exc:  # noqa: BLE001 - report candidate-level failures.
+                    candidates.append({**row, "error": str(exc), "quality": {"allowed": False, "reason": "book_error"}})
+                    continue
+                for vol in vols:
+                    fv = fair_value_target_hit(
+                        current_price=current_price,
+                        target_price=float(target_price),
+                        seconds_to_expiry=seconds_to_expiry,
+                        annualized_vol=vol,
+                    )
+                    ask = book.best_ask
+                    edge = fv.probability_yes - ask if ask is not None else None
+                    candidates.append(
+                        {
+                            "slug": row.get("slug"),
+                            "condition_id": row.get("condition_id"),
+                            "token_id": row.get("yes_token_id"),
+                            "target_price": float(target_price),
+                            "annualized_vol": vol,
+                            "probability_yes": fv.probability_yes,
+                            "best_bid": book.best_bid,
+                            "best_ask": ask,
+                            "edge": edge,
+                            "quality": quality,
+                            "passes": {
+                                str(threshold): bool(quality.get("allowed") and edge is not None and edge >= threshold)
+                                for threshold in edges
+                            },
+                        }
+                    )
+            summary = {
+                str(vol): {
+                    str(edge): sum(1 for row in candidates if row.get("annualized_vol") == vol and (row.get("passes") or {}).get(str(edge)))
+                    for edge in edges
+                }
+                for vol in vols
+            }
+            payload = {
+                "mode": "multi_strike_research_only",
+                "event_slug": args.event_slug,
+                "symbol": args.symbol,
+                "current_price": current_price,
+                "consensus_sources": list(sources),
+                "max_deviation_pct": max_dev,
+                "summary": summary,
+                "candidates": candidates,
+                "recommendation": "paper_watch_only_if_candidate_passes_quality_and_edge_threshold",
+            }
+            if args.output:
+                path = Path(args.output)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                payload["output"] = str(path)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        finally:
+            gamma.close()
+            clob.close()
+
+    if args.multi_strike_command == "historical-approx":
+        from hermes_polymarket.backtest.multi_strike_historical_approx import replay_yes_trade_path
+        from hermes_polymarket.crypto.multi_strike_fair_value import fair_value_target_hit
+        from hermes_polymarket.crypto.multi_strike_market import parse_multi_strike_target
+        from hermes_polymarket.crypto.watchlist_seeding import current_reference_consensus
+        from hermes_polymarket.data_sources.polymarket_data_api import PolymarketDataApi
+
+        gamma = GammaClient()
+        data_api = PolymarketDataApi()
+        try:
+            markets = gamma.markets_by_slug(args.market_slug)
+            if not markets:
+                print(json.dumps({"status": "market_not_found", "market_slug": args.market_slug}, indent=2, sort_keys=True))
+                return 2
+            market = markets[0]
+            condition_id = str(market.get("conditionId") or market.get("condition_id") or "")
+            tokens = json.loads(market.get("clobTokenIds") or "[]") if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds") or []
+            yes_token = str(tokens[0]) if tokens else ""
+            current_price, sources, max_dev = current_reference_consensus(args.symbol)
+            target = parse_multi_strike_target(f"{market.get('question') or ''} {market.get('slug') or ''}", current_price=current_price)
+            if target is None:
+                print(json.dumps({"status": "target_parse_failed", "market_slug": args.market_slug}, indent=2, sort_keys=True))
+                return 2
+            seconds_to_expiry = 1.0
+            if market.get("endDate"):
+                with contextlib.suppress(ValueError):
+                    parsed = datetime.fromisoformat(str(market["endDate"]).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    seconds_to_expiry = max(1.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+            fv = fair_value_target_hit(
+                current_price=current_price,
+                target_price=target.target_price,
+                seconds_to_expiry=seconds_to_expiry,
+                annualized_vol=args.annualized_vol,
+            )
+            trades = data_api.get_trades(market=condition_id, limit=args.limit)
+            results, summary = replay_yes_trade_path(
+                trades,
+                token_id=yes_token,
+                model_probability=fv.probability_yes,
+                edge_threshold=args.edge_threshold,
+                amount_usd=args.amount,
+                hold_seconds=args.hold_seconds,
+            )
+            payload = {
+                "mode": "multi_strike_historical_approx",
+                "data_quality": "historical_approx_current_model",
+                "market_slug": args.market_slug,
+                "condition_id": condition_id,
+                "symbol": args.symbol,
+                "current_price": current_price,
+                "consensus_sources": list(sources),
+                "max_deviation_pct": max_dev,
+                "fair_value": fv.to_dict(),
+                "summary": summary,
+                "trades": [row.to_dict() for row in results],
+                "warning": "Uses current model probability over historical trade prints; not executable L2 truth.",
+            }
+            if args.output:
+                path = Path(args.output)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                payload["output"] = str(path)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        finally:
+            gamma.close()
+            data_api.close()
+
+    print(f"unknown multi-strike command: {args.multi_strike_command}")
+    return 2
+
+
 def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
     from hermes_polymarket.forward_paper.artifacts import write_forward_paper_artifacts
     from hermes_polymarket.forward_paper.quality import forward_paper_quality_warnings
@@ -3032,6 +3246,45 @@ def build_parser() -> argparse.ArgumentParser:
     weather.add_argument("--low", type=float, default=None)
     weather.add_argument("--high", type=float, default=75.0)
     weather.set_defaults(func=cmd_signal_weather)
+
+    multi_strike = sub.add_parser("multi-strike")
+    multi_strike_sub = multi_strike.add_subparsers(dest="multi_strike_command", required=True)
+    multi_strike_watch = multi_strike_sub.add_parser("paper-watch")
+    multi_strike_watch.add_argument("--event-slug", required=True)
+    multi_strike_watch.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    multi_strike_watch.add_argument("--amount", type=float, default=5.0)
+    multi_strike_watch.add_argument("--edge-threshold", type=float, default=0.08)
+    multi_strike_watch.add_argument("--exit-edge-threshold", type=float, default=0.02)
+    multi_strike_watch.add_argument("--seconds", type=int, default=3600)
+    multi_strike_watch.add_argument("--mark-interval-seconds", type=int, default=300)
+    multi_strike_watch.add_argument("--annualized-vol", type=float, default=0.80)
+    multi_strike_watch.add_argument("--min-ask", type=float, default=0.03)
+    multi_strike_watch.add_argument("--max-ask", type=float, default=0.60)
+    multi_strike_watch.add_argument("--take-profit-cents", type=float, default=5.0)
+    multi_strike_watch.add_argument("--stop-loss-cents", type=float, default=5.0)
+    multi_strike_watch.add_argument("--timeout-seconds", type=int, default=3600)
+    multi_strike_watch.add_argument("--close-open-on-end", action="store_true")
+    multi_strike_watch.set_defaults(func=cmd_multi_strike)
+    multi_strike_report = multi_strike_sub.add_parser("report")
+    multi_strike_report.add_argument("--run-id", required=True)
+    multi_strike_report.set_defaults(func=cmd_multi_strike)
+    multi_strike_calibrate = multi_strike_sub.add_parser("calibrate")
+    multi_strike_calibrate.add_argument("--event-slug", required=True)
+    multi_strike_calibrate.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    multi_strike_calibrate.add_argument("--vol-grid", default="0.4,0.6,0.8,1.0,1.2")
+    multi_strike_calibrate.add_argument("--edge-grid", default="0.03,0.05,0.08,0.10,0.15")
+    multi_strike_calibrate.add_argument("--output", default=None)
+    multi_strike_calibrate.set_defaults(func=cmd_multi_strike)
+    multi_strike_hist = multi_strike_sub.add_parser("historical-approx")
+    multi_strike_hist.add_argument("--market-slug", required=True)
+    multi_strike_hist.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    multi_strike_hist.add_argument("--amount", type=float, default=5.0)
+    multi_strike_hist.add_argument("--edge-threshold", type=float, default=0.08)
+    multi_strike_hist.add_argument("--hold-seconds", type=int, default=3600)
+    multi_strike_hist.add_argument("--annualized-vol", type=float, default=0.80)
+    multi_strike_hist.add_argument("--limit", type=int, default=500)
+    multi_strike_hist.add_argument("--output", default=None)
+    multi_strike_hist.set_defaults(func=cmd_multi_strike)
 
     wallet_flow = sub.add_parser("wallet-flow")
     wallet_sub = wallet_flow.add_subparsers(dest="wallet_command", required=True)

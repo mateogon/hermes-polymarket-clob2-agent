@@ -67,6 +67,31 @@ class PolymarketDataApi:
         parsed = [parse_wallet_trade(row) for row in rows]
         return [trade for trade in parsed if trade is not None]
 
+    def get_trades(
+        self,
+        *,
+        market: str | None = None,
+        asset: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[WalletTrade]:
+        params: dict[str, Any] = {
+            "limit": limit,
+            "offset": offset,
+        }
+        if market:
+            params["market"] = market
+        if asset:
+            params["asset"] = asset
+
+        response = self._http.get(f"{DATA_API}/trades", params=params)
+        response.raise_for_status()
+        rows = response.json()
+        if not isinstance(rows, list):
+            return []
+        parsed = [parse_wallet_trade(row) for row in rows]
+        return [trade for trade in parsed if trade is not None]
+
 
 def parse_wallet_trade(row: Any) -> WalletTrade | None:
     if not isinstance(row, dict):
@@ -88,4 +113,3 @@ def parse_wallet_trade(row: Any) -> WalletTrade | None:
         )
     except (KeyError, TypeError, ValueError):
         return None
-
