@@ -421,3 +421,110 @@ def test_universe_strike_events_lists_candidate_events(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["events"][0]["event_slug"] == "bitcoin-above-on-may-3"
     assert payload["events"][0]["candidate_count"] == 2
+
+
+def test_availability_monitor_reports_waiting_for_venue(monkeypatch, tmp_path, capsys):
+    class FakeGamma:
+        def list_events(self, **_kwargs):
+            return [
+                {
+                    "slug": "bitcoin-long-dated",
+                    "title": "Bitcoin long dated",
+                    "markets": [
+                        _market(
+                            conditionId="long-dated",
+                            question="Will Bitcoin hit $150k by December 31, 2026?",
+                            slug="will-bitcoin-hit-150k-by-december-31-2026",
+                            outcomes='["Yes", "No"]',
+                            clobTokenIds='["yes-token", "no-token"]',
+                            endDate="2027-01-01T04:00:00Z",
+                        )
+                    ],
+                }
+            ]
+
+        def list_markets(self, **_kwargs):
+            return []
+
+        def close(self):
+            pass
+
+    output = tmp_path / "availability.json"
+    monkeypatch.setattr("hermes_polymarket.cli.GammaClient", FakeGamma)
+
+    assert main(
+        [
+            "crypto-latency",
+            "availability-monitor",
+            "--symbols",
+            "btcusdt",
+            "--duration-seconds",
+            "0",
+            "--poll-seconds",
+            "0",
+            "--limit-events",
+            "10",
+            "--limit-markets",
+            "0",
+            "--output",
+            str(output),
+        ]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["checks"] == 1
+    assert payload["availability"]["btcusdt"]["strike_healthy_checks"] == 0
+    assert payload["availability"]["btcusdt"]["recommendation"] == "waiting_for_healthy_venue"
+    assert output.exists()
+
+
+def test_availability_monitor_reports_strike_availability(monkeypatch, tmp_path, capsys):
+    class FakeGamma:
+        def list_events(self, **_kwargs):
+            return [
+                {
+                    "slug": "bitcoin-above-on-may-3",
+                    "title": "Bitcoin above on May 3",
+                    "markets": [
+                        _market(
+                            conditionId="above-78",
+                            question="Will Bitcoin be above $78,000 on May 3?",
+                            slug="bitcoin-above-78k-on-may-3",
+                            outcomes='["Yes", "No"]',
+                            clobTokenIds='["yes-token", "no-token"]',
+                            endDate="2027-01-01T04:00:00Z",
+                        )
+                    ],
+                }
+            ]
+
+        def list_markets(self, **_kwargs):
+            return []
+
+        def close(self):
+            pass
+
+    output = tmp_path / "availability.json"
+    monkeypatch.setattr("hermes_polymarket.cli.GammaClient", FakeGamma)
+
+    assert main(
+        [
+            "crypto-latency",
+            "availability-monitor",
+            "--symbols",
+            "btcusdt",
+            "--duration-seconds",
+            "0",
+            "--poll-seconds",
+            "0",
+            "--limit-events",
+            "10",
+            "--limit-markets",
+            "0",
+            "--output",
+            str(output),
+        ]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["availability"]["btcusdt"]["strike_healthy_checks"] == 1
+    assert payload["availability"]["btcusdt"]["best_event_slug"] == "bitcoin-above-on-may-3"
+    assert payload["availability"]["btcusdt"]["recommendation"] == "run_v2_when_preflight_passes"

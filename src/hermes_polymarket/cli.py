@@ -1265,6 +1265,126 @@ def cmd_crypto_latency_source_health(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_crypto_latency_availability_monitor(args: argparse.Namespace) -> int:
+    from hermes_polymarket.crypto.market_universe import fetch_gamma_universe, scan_market_universe
+
+    symbols = tuple(symbol.strip().lower() for symbol in args.symbols.split(",") if symbol.strip())
+    market_types = {market_type.strip() for market_type in args.market_types.split(",") if market_type.strip()}
+    if not symbols:
+        print("availability-monitor requires at least one symbol")
+        return 2
+    started = time.time()
+    deadline = started + max(0, args.duration_seconds)
+    checks: list[dict[str, Any]] = []
+    aggregate: dict[str, dict[str, Any]] = {
+        symbol: {
+            "up_down_healthy_checks": 0,
+            "strike_healthy_checks": 0,
+            "multi_strike_checks": 0,
+            "best_score": 0.0,
+            "best_up_down_score": 0.0,
+            "best_strike_score": 0.0,
+            "best_multi_strike_score": 0.0,
+            "best_event_slug": None,
+        }
+        for symbol in symbols
+    }
+
+    attempt = 0
+    while True:
+        attempt += 1
+        gamma = GammaClient()
+        try:
+            events, markets = fetch_gamma_universe(gamma, limit_events=args.limit_events, limit_markets=args.limit_markets)
+        finally:
+            gamma.close()
+        universe = scan_market_universe(events=events, markets=markets, symbols=set(symbols))
+        rows = [row for row in universe.get("candidates", []) if isinstance(row, dict)]
+        by_symbol: dict[str, dict[str, Any]] = {}
+        for symbol in symbols:
+            symbol_rows = [row for row in rows if row.get("symbol") == symbol]
+            up_down = [row for row in symbol_rows if row.get("market_type") == "up_down" and float(row.get("score") or 0.0) >= args.min_score]
+            strike = [
+                row
+                for row in symbol_rows
+                if row.get("market_type") in {"above_strike", "below_strike"} and float(row.get("score") or 0.0) >= args.min_score
+            ]
+            multi_strike = [
+                row
+                for row in symbol_rows
+                if row.get("market_type") == "multi_strike_event" and float(row.get("score") or 0.0) >= args.min_score
+            ]
+            best_rows = sorted(symbol_rows, key=lambda row: float(row.get("score") or 0.0), reverse=True)
+            best = best_rows[0] if best_rows else {}
+            best_up = max((float(row.get("score") or 0.0) for row in up_down), default=0.0)
+            best_strike = max((float(row.get("score") or 0.0) for row in strike), default=0.0)
+            best_multi = max((float(row.get("score") or 0.0) for row in multi_strike), default=0.0)
+            aggregate_row = aggregate[symbol]
+            aggregate_row["up_down_healthy_checks"] += int(bool(up_down) and "up_down" in market_types)
+            aggregate_row["strike_healthy_checks"] += int(bool(strike) and "strike" in market_types)
+            aggregate_row["multi_strike_checks"] += int(bool(multi_strike))
+            aggregate_row["best_score"] = max(float(aggregate_row["best_score"]), float(best.get("score") or 0.0))
+            aggregate_row["best_up_down_score"] = max(float(aggregate_row["best_up_down_score"]), best_up)
+            aggregate_row["best_strike_score"] = max(float(aggregate_row["best_strike_score"]), best_strike)
+            aggregate_row["best_multi_strike_score"] = max(float(aggregate_row["best_multi_strike_score"]), best_multi)
+            if best.get("event_slug") and float(best.get("score") or 0.0) >= float(aggregate_row["best_score"]):
+                aggregate_row["best_event_slug"] = best.get("event_slug")
+            by_symbol[symbol] = {
+                "up_down_candidates": len(up_down),
+                "strike_candidates": len(strike),
+                "multi_strike_candidates": len(multi_strike),
+                "best_score": float(best.get("score") or 0.0),
+                "best_market_type": best.get("market_type"),
+                "best_event_slug": best.get("event_slug"),
+                "best_slug": best.get("slug"),
+            }
+        checks.append(
+            {
+                "attempt": attempt,
+                "ts_ms": int(time.time() * 1000),
+                "scanned_events": universe.get("scanned_events"),
+                "scanned_markets": universe.get("scanned_markets"),
+                "classified": universe.get("classified"),
+                "by_symbol": by_symbol,
+            }
+        )
+        if args.duration_seconds <= 0 or time.time() >= deadline:
+            break
+        remaining = max(0.0, deadline - time.time())
+        time.sleep(min(args.poll_seconds, remaining))
+
+    availability = {
+        symbol: {
+            **row,
+            "recommendation": (
+                "run_v2_when_preflight_passes"
+                if int(row["strike_healthy_checks"]) > 0 or int(row["up_down_healthy_checks"]) > 0
+                else "waiting_for_healthy_venue"
+            ),
+        }
+        for symbol, row in aggregate.items()
+    }
+    output = {
+        "mode": "measurement_paper_only",
+        "duration_seconds": max(0, int(time.time() - started)),
+        "requested_duration_seconds": args.duration_seconds,
+        "poll_seconds": args.poll_seconds,
+        "checks": len(checks),
+        "market_types": sorted(market_types),
+        "min_score": args.min_score,
+        "availability": availability,
+        "latest_check": checks[-1] if checks else None,
+        "recommendation": "Run v2 only when strike_healthy_checks or up_down_healthy_checks is greater than 0.",
+    }
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n")
+        output["output"] = str(output_path)
+    print(json.dumps(output, indent=2, sort_keys=True))
+    return 0
+
+
 def _rotate_strikes_for_watchlist(
     db: Database,
     settings: Any,
@@ -2883,6 +3003,16 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_discover_updown.add_argument("--limit", type=int, default=300)
     crypto_discover_updown.add_argument("--debug", action="store_true")
     crypto_discover_updown.set_defaults(func=cmd_crypto_latency_discover_updown)
+    crypto_availability = crypto_sub.add_parser("availability-monitor")
+    crypto_availability.add_argument("--symbols", default="btcusdt,ethusdt,solusdt,xrpusdt")
+    crypto_availability.add_argument("--market-types", default="up_down,strike")
+    crypto_availability.add_argument("--poll-seconds", type=int, default=300)
+    crypto_availability.add_argument("--duration-seconds", type=int, default=3600)
+    crypto_availability.add_argument("--limit-events", type=int, default=1000)
+    crypto_availability.add_argument("--limit-markets", type=int, default=1000)
+    crypto_availability.add_argument("--min-score", type=float, default=0.75)
+    crypto_availability.add_argument("--output", default="artifacts/availability/latest.json")
+    crypto_availability.set_defaults(func=cmd_crypto_latency_availability_monitor)
     crypto_universe = crypto_sub.add_parser("universe")
     universe_sub = crypto_universe.add_subparsers(dest="universe_action", required=True)
     universe_scan = universe_sub.add_parser("scan")
