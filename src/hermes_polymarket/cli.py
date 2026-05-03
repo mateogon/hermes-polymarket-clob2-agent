@@ -1330,6 +1330,29 @@ def cmd_crypto_latency_watchlist(args: argparse.Namespace) -> int:
                     sort_keys=True,
                 )
             )
+        elif args.watchlist_action == "l2-preflight":
+            from hermes_polymarket.crypto.l2_preflight import run_l2_preflight
+
+            report = asyncio.run(
+                run_l2_preflight(
+                    db=db,
+                    settings=settings,
+                    symbol=args.symbol,
+                    condition_id=args.condition_id,
+                    seconds=args.seconds,
+                    require_rest_book=args.require_rest_book,
+                    require_ws_book=args.require_ws_book,
+                    require_bbo=args.require_bbo,
+                )
+            )
+            artifacts: dict[str, str] = {}
+            if args.write_artifacts:
+                artifact_dir = Path(args.artifact_dir)
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                path = artifact_dir / f"l2_preflight_{now_ms()}.json"
+                path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+                artifacts["report"] = str(path)
+            print(json.dumps({**report, "artifacts": artifacts}, indent=2, sort_keys=True))
         elif args.watchlist_action == "score":
             from hermes_polymarket.crypto.market_score import score_watchlist_markets
 
@@ -1471,9 +1494,11 @@ def cmd_crypto_latency_opportunities(args: argparse.Namespace) -> int:
 def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
     from hermes_polymarket.forward_paper.artifacts import write_forward_paper_artifacts
     from hermes_polymarket.forward_paper.quality import forward_paper_quality_warnings
+    from hermes_polymarket.crypto.l2_preflight import seed_rest_orderbooks
     from hermes_polymarket.crypto.paper_watcher import PaperWatcherConfig, run_crypto_paper_watcher
     from hermes_polymarket.data_sources.base import DataEvent, EventType, now_ms
     from hermes_polymarket.data_sources.event_bus import EventBus
+    from hermes_polymarket.state.orderbook_state import OrderBookState
     from hermes_polymarket.storage.crypto_latency import crypto_latency_report
     from hermes_polymarket.storage.crypto_watchlist import crypto_market_watchlist, watchlist_token_ids
     from hermes_polymarket.storage.forward_positions import (
@@ -1496,6 +1521,16 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
             return 2
         seconds = max(1, min(args.seconds, 900))
         watchlist = crypto_market_watchlist(db, active_only=True, limit=args.max_watchlist_markets) if args.from_watchlist else []
+        initial_token_ids = tuple(
+            dict.fromkeys(
+                token_id
+                for row in watchlist
+                for token_id in (str(row["yes_token_id"]), str(row["no_token_id"]))
+                if token_id
+            )
+        )
+        if args.seed_rest_books and initial_token_ids:
+            seed_rest_orderbooks(db=db, settings=settings, token_ids=initial_token_ids)
         if args.best_markets_only and watchlist:
             from hermes_polymarket.crypto.market_score import best_watchlist_markets
 
@@ -1600,6 +1635,10 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
         async def run() -> dict[str, Any]:
             bus = EventBus()
             tasks: list[asyncio.Task[None]] = []
+            book_state = OrderBookState()
+            rest_seed: dict[str, Any] = {}
+            if args.seed_rest_books and token_ids:
+                rest_seed = seed_rest_orderbooks(db=db, settings=settings, token_ids=token_ids, book_state=book_state)
             if args.fixture:
                 await publish_fixture(bus)
             else:
@@ -1647,6 +1686,7 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                         min_market_score=args.min_market_score if args.best_markets_only else 0.0,
                     ),
                     watchlist=watchlist,
+                    book_state=book_state,
                     settings=settings,
                 )
             finally:
@@ -1723,6 +1763,7 @@ def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
                 "from_watchlist": args.from_watchlist,
                 "healthy_only": args.healthy_only,
                 "watchlist_token_count": len(token_ids),
+                "rest_book_seed": rest_seed,
                 "summary": summary_dict,
                 "position_report": position_report,
                 "quality": quality,
@@ -2451,6 +2492,15 @@ def build_parser() -> argparse.ArgumentParser:
     watchlist_reference.add_argument("--reference-price", type=float, required=True)
     watchlist_reference.add_argument("--window-start-ts", type=int, default=None)
     watchlist_reference.add_argument("--window-end-ts", type=int, default=None)
+    watchlist_l2_preflight = watchlist_sub.add_parser("l2-preflight")
+    watchlist_l2_preflight.add_argument("--symbol", default=None)
+    watchlist_l2_preflight.add_argument("--condition-id", default=None)
+    watchlist_l2_preflight.add_argument("--seconds", type=int, default=30)
+    watchlist_l2_preflight.add_argument("--require-rest-book", action="store_true")
+    watchlist_l2_preflight.add_argument("--require-ws-book", action="store_true")
+    watchlist_l2_preflight.add_argument("--require-bbo", action="store_true")
+    watchlist_l2_preflight.add_argument("--write-artifacts", action="store_true")
+    watchlist_l2_preflight.add_argument("--artifact-dir", default="artifacts/l2_preflight")
     watchlist_score = watchlist_sub.add_parser("score")
     watchlist_score.add_argument("--symbol", default=None)
     watchlist_best = watchlist_sub.add_parser("best")
@@ -2517,6 +2567,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_watch.add_argument("--stale-quote-window-ms", type=int, default=1500)
     crypto_paper_watch.add_argument("--use-fair-value", action="store_true")
     crypto_paper_watch.add_argument("--fair-value-min-edge", type=float, default=0.03)
+    crypto_paper_watch.add_argument("--seed-rest-books", action="store_true")
     crypto_paper_watch.add_argument(
         "--healthy-only",
         action="store_true",
@@ -2552,6 +2603,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_paper_watch_v2.add_argument("--stale-quote-window-ms", type=int, default=1500)
     crypto_paper_watch_v2.add_argument("--use-fair-value", action="store_true", default=True)
     crypto_paper_watch_v2.add_argument("--fair-value-min-edge", type=float, default=0.03)
+    crypto_paper_watch_v2.add_argument("--seed-rest-books", action="store_true", default=True)
     crypto_paper_watch_v2.set_defaults(func=cmd_crypto_paper_watch_v2)
     crypto_paper_positions = crypto_paper_sub.add_parser("positions")
     crypto_paper_positions.add_argument("--open", action="store_true")
