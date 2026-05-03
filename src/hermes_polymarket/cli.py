@@ -802,6 +802,43 @@ def cmd_crypto_latency_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_crypto_latency_discover_updown(args: argparse.Namespace) -> int:
+    from hermes_polymarket.crypto.updown_discovery import discover_updown_from_events
+    from hermes_polymarket.polymarket.gamma_client import GammaClient
+
+    symbols = {symbol.strip().lower() for symbol in args.symbols.split(",") if symbol.strip()}
+    if not symbols:
+        print("discover-updown requires at least one symbol")
+        return 2
+
+    gamma = GammaClient()
+    events: list[dict[str, Any]] = []
+    try:
+        remaining = args.limit
+        offset = 0
+        while remaining > 0:
+            page_limit = min(300, remaining)
+            page = gamma.list_events(active="true", closed="false", order="volume_24hr", ascending="false", limit=page_limit, offset=offset)
+            if not page:
+                break
+            events.extend(page)
+            if len(page) < page_limit:
+                break
+            remaining -= page_limit
+            offset += page_limit
+        payload = discover_updown_from_events(events, symbols=symbols)
+        payload["mode"] = "measurement_paper_only"
+        payload["status"] = "discovered" if payload["discovered"] else "no_active_updown_markets_found"
+        payload["symbols"] = sorted(symbols)
+        payload["events_seen"] = len(events)
+        if not args.debug:
+            payload.pop("debug", None)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    finally:
+        gamma.close()
+    return 0
+
+
 def cmd_crypto_latency_record(args: argparse.Namespace) -> int:
     from hermes_polymarket.crypto.latency_recorder import RecorderConfig, run_crypto_latency_recorder
     from hermes_polymarket.data_sources.base import DataEvent, EventType, now_ms
@@ -2167,6 +2204,11 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_discover.add_argument("--query", action="append", help="Gamma search query; may be repeated")
     crypto_discover.add_argument("--debug-candidates", action="store_true")
     crypto_discover.set_defaults(func=cmd_crypto_latency_discover)
+    crypto_discover_updown = crypto_sub.add_parser("discover-updown")
+    crypto_discover_updown.add_argument("--symbols", default="btcusdt,ethusdt,solusdt,xrpusdt")
+    crypto_discover_updown.add_argument("--limit", type=int, default=300)
+    crypto_discover_updown.add_argument("--debug", action="store_true")
+    crypto_discover_updown.set_defaults(func=cmd_crypto_latency_discover_updown)
     crypto_record = crypto_sub.add_parser("record")
     crypto_record.add_argument("--seconds", type=int, default=300)
     crypto_record.add_argument("--symbols", default="btcusdt,ethusdt,solusdt,xrpusdt")
