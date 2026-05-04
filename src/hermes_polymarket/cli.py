@@ -204,6 +204,10 @@ def cmd_research(args: argparse.Namespace) -> int:
             payload = _research_data_command(args)
             print(json.dumps({"environment": settings.environment, **payload}, indent=2, sort_keys=True))
             return 0
+        if args.research_command == "market-families":
+            payload = _research_market_families_command(args)
+            print(json.dumps({"environment": settings.environment, **payload}, indent=2, sort_keys=True))
+            return 0
     finally:
         db.close()
     print("unknown research command")
@@ -289,6 +293,20 @@ def _research_data_command(args: argparse.Namespace) -> dict[str, Any]:
             )
             return {"mode": "research_data_fetch", "kind": args.kind, "manifest": manifest}
     return {"mode": "research_data_cache", "status": "unknown_command"}
+
+
+def _research_market_families_command(args: argparse.Namespace) -> dict[str, Any]:
+    from hermes_polymarket.research.market_families import classify_market_family, load_markets_from_file, scan_market_families
+
+    if args.family_command == "classify":
+        return {"mode": "research_market_family_classify", "classification": classify_market_family(args.text, current_price=args.current_price).to_dict()}
+    if args.family_command == "scan":
+        markets = load_markets_from_file(args.file)
+        prices = {}
+        if args.current_prices_json:
+            prices = json.loads(args.current_prices_json)
+        return scan_market_families(markets, current_prices=prices, limit=args.limit)
+    return {"mode": "research_market_family", "status": "unknown_command"}
 
 
 def cmd_wallet_flow_report(args: argparse.Namespace) -> int:
@@ -4143,6 +4161,17 @@ def build_parser() -> argparse.ArgumentParser:
     data_fetch.add_argument("--order", default="volume_24hr")
     data_fetch.add_argument("--label", default="")
     data_fetch.set_defaults(func=cmd_research)
+    research_families = research_sub.add_parser("market-families")
+    research_families_sub = research_families.add_subparsers(dest="family_command", required=True)
+    family_classify = research_families_sub.add_parser("classify")
+    family_classify.add_argument("--text", required=True)
+    family_classify.add_argument("--current-price", type=float, default=None)
+    family_classify.set_defaults(func=cmd_research)
+    family_scan = research_families_sub.add_parser("scan")
+    family_scan.add_argument("--file", required=True)
+    family_scan.add_argument("--current-prices-json", default="")
+    family_scan.add_argument("--limit", type=int, default=100)
+    family_scan.set_defaults(func=cmd_research)
 
     scan = sub.add_parser("scan")
     scan.add_argument("--mode", default="paper", choices=["paper", "dry-run", "live"])
