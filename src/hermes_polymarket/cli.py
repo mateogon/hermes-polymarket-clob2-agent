@@ -2985,6 +2985,207 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
             data_api.close()
             binance.close()
 
+    if args.multi_strike_command == "sweep-from-cache":
+        from hermes_polymarket.backtest.multi_strike_historical_approx import SpotSeries, replay_yes_trade_path_with_spot
+        from hermes_polymarket.crypto.multi_strike_market import parse_multi_strike_target
+        from hermes_polymarket.research.data_cache import ResearchDataCache
+
+        cache = ResearchDataCache()
+        market_slugs = [value.strip() for value in args.market_slugs.split(",") if value.strip()]
+        vols = [float(value) for value in args.vol_grid.split(",") if value.strip()] if args.vol_mode == "fixed" else [args.annualized_vol]
+        edges = [float(value) for value in args.edge_grid.split(",") if value.strip()]
+        holds = [int(value) for value in args.hold_grid.split(",") if value.strip()]
+        costs = [float(value) for value in args.cost_cents_grid.split(",") if value.strip()]
+        rows: list[dict[str, Any]] = []
+        market_reports: list[dict[str, Any]] = []
+        for market_slug in market_slugs:
+            market = cache.load_gamma_market(slug=market_slug)
+            if market is None:
+                market_reports.append({"market_slug": market_slug, "status": "missing_gamma_market_cache"})
+                continue
+            condition_id = str(market.get("conditionId") or market.get("condition_id") or "")
+            tokens = json.loads(market.get("clobTokenIds") or "[]") if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds") or []
+            yes_token = str(tokens[0]) if tokens else ""
+            end_date = market.get("endDate")
+            if not condition_id or not yes_token or not end_date:
+                market_reports.append({"market_slug": market_slug, "status": "missing_market_fields"})
+                continue
+            trades = cache.load_polymarket_trades(condition_id=condition_id)
+            if not trades:
+                market_reports.append({"market_slug": market_slug, "status": "missing_polymarket_trades_cache", "condition_id": condition_id})
+                continue
+            min_trade_ts_ms = min(trade.timestamp for trade in trades) * 1000
+            max_trade_ts_ms = max(trade.timestamp for trade in trades) * 1000
+            candle_start = args.spot_start_ts_ms or max(0, min_trade_ts_ms - 60_000)
+            candle_end = args.spot_end_ts_ms or (max_trade_ts_ms + max(max(holds) * 1000 if holds else 0, 60_000))
+            candles = cache.find_binance_klines(symbol=args.symbol, interval=args.interval, start_ts_ms=candle_start, end_ts_ms=candle_end)
+            if not candles:
+                market_reports.append(
+                    {
+                        "market_slug": market_slug,
+                        "status": "missing_binance_klines_cache",
+                        "condition_id": condition_id,
+                        "start_ts_ms": candle_start,
+                        "end_ts_ms": candle_end,
+                    }
+                )
+                continue
+            parsed_end = datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+            if parsed_end.tzinfo is None:
+                parsed_end = parsed_end.replace(tzinfo=timezone.utc)
+            expiry_ts_ms = int(parsed_end.timestamp() * 1000)
+            spot_prices = [(int(candle["open_ts_ms"]), float(candle["close"])) for candle in candles]
+            target = parse_multi_strike_target(f"{market.get('question') or ''} {market.get('slug') or ''}", current_price=spot_prices[0][1])
+            if target is None:
+                market_reports.append({"market_slug": market_slug, "status": "target_parse_failed", "condition_id": condition_id})
+                continue
+            market_reports.append(
+                {
+                    "market_slug": market_slug,
+                    "status": "ok",
+                    "condition_id": condition_id,
+                    "target_price": target.target_price,
+                    "observed_trades": len(trades),
+                    "spot_points": len(spot_prices),
+                }
+            )
+            dynamic_vol_by_ts_ms = None
+            if args.vol_mode == "realized":
+                spot_series = SpotSeries(spot_prices)
+                dynamic_vol_by_ts_ms = {
+                    trade.timestamp * 1000: vol
+                    for trade in trades
+                    if (
+                        vol := spot_series.realized_annualized_vol(
+                            trade.timestamp * 1000,
+                            window_seconds=args.vol_window_seconds,
+                            min_annualized_vol=args.min_annualized_vol,
+                            max_annualized_vol=args.max_annualized_vol,
+                        )
+                    )
+                    is not None
+                }
+            for vol in vols:
+                for edge in edges:
+                    for hold in holds:
+                        for cost in costs:
+                            results, summary = replay_yes_trade_path_with_spot(
+                                trades,
+                                token_id=yes_token,
+                                spot_prices=spot_prices,
+                                target_price=target.target_price,
+                                expiry_ts_ms=expiry_ts_ms,
+                                annualized_vol=vol,
+                                edge_threshold=edge,
+                                amount_usd=args.amount,
+                                hold_seconds=hold,
+                                cost_cents=cost,
+                                dynamic_vol_window_seconds=args.vol_window_seconds if args.vol_mode == "realized" else None,
+                                min_annualized_vol=args.min_annualized_vol,
+                                max_annualized_vol=args.max_annualized_vol,
+                                dynamic_vol_by_ts_ms=dynamic_vol_by_ts_ms,
+                            )
+                            row = {
+                                "market_slug": market_slug,
+                                "condition_id": condition_id,
+                                "symbol": args.symbol,
+                                "target_price": target.target_price,
+                                "annualized_vol": vol,
+                                "vol_mode": args.vol_mode,
+                                "vol_window_seconds": args.vol_window_seconds if args.vol_mode == "realized" else None,
+                                "avg_selected_vol": summary.get("avg_annualized_vol"),
+                                "avg_evaluated_vol": summary.get("avg_evaluated_annualized_vol"),
+                                "edge_threshold": edge,
+                                "hold_seconds": hold,
+                                "cost_cents": cost,
+                                "amount_usd": args.amount,
+                                **summary,
+                            }
+                            row["robust_score"] = float(row["net_pnl"] or 0.0) - float(row["max_drawdown"] or 0.0)
+                            row["passes_promotion_gate"] = bool(
+                                int(row["simulated_trades"]) >= args.min_trades
+                                and float(row["net_pnl"] or 0.0) > 0
+                                and float(row["profit_factor"] or 0.0) >= args.min_profit_factor
+                                and float(row["max_drawdown"] or 0.0) <= args.max_drawdown
+                            )
+                            row["sample_trades"] = [trade.to_dict() for trade in results[: args.sample_trades]]
+                            rows.append(row)
+        ranked = sorted(
+            rows,
+            key=lambda row: (
+                bool(row.get("passes_promotion_gate")),
+                float(row.get("robust_score") or 0.0),
+                float(row.get("profit_factor") or 0.0),
+                float(row.get("net_pnl") or 0.0),
+                int(row.get("simulated_trades") or 0),
+            ),
+            reverse=True,
+        )
+        payload = {
+            "mode": "multi_strike_sweep_from_cache",
+            "data_quality": "research_cache_public_historical",
+            "cache_root": str(cache.root),
+            "symbol": args.symbol,
+            "market_slugs": market_slugs,
+            "grids": {
+                "annualized_vol": vols,
+                "vol_mode": args.vol_mode,
+                "vol_window_seconds": args.vol_window_seconds if args.vol_mode == "realized" else None,
+                "edge_threshold": edges,
+                "hold_seconds": holds,
+                "cost_cents": costs,
+            },
+            "promotion_gate": {
+                "min_trades": args.min_trades,
+                "min_profit_factor": args.min_profit_factor,
+                "max_drawdown": args.max_drawdown,
+            },
+            "markets": market_reports,
+            "rows": ranked,
+            "top": ranked[: args.top],
+            "warning": "Research-only replay from cached public trade prints and candles; not executable L2 truth.",
+        }
+        if args.output:
+            path = Path(args.output)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            payload["output"] = str(path)
+        if args.csv_output:
+            csv_path = Path(args.csv_output)
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            fieldnames = [
+                "market_slug",
+                "symbol",
+                "target_price",
+                "annualized_vol",
+                "vol_mode",
+                "vol_window_seconds",
+                "avg_selected_vol",
+                "avg_evaluated_vol",
+                "edge_threshold",
+                "hold_seconds",
+                "cost_cents",
+                "simulated_trades",
+                "net_pnl",
+                "avg_roi",
+                "win_rate",
+                "profit_factor",
+                "max_drawdown",
+                "robust_score",
+                "passes_promotion_gate",
+                "skipped_below_edge",
+                "skipped_no_spot",
+                "skipped_no_vol",
+            ]
+            with csv_path.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in ranked:
+                    writer.writerow({field: row.get(field) for field in fieldnames})
+            payload["csv_output"] = str(csv_path)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
     print(f"unknown multi-strike command: {args.multi_strike_command}")
     return 2
 
@@ -4046,6 +4247,30 @@ def build_parser() -> argparse.ArgumentParser:
     multi_strike_sweep.add_argument("--output", default=None)
     multi_strike_sweep.add_argument("--csv-output", default=None)
     multi_strike_sweep.set_defaults(func=cmd_multi_strike)
+    multi_strike_sweep_cache = multi_strike_sub.add_parser("sweep-from-cache")
+    multi_strike_sweep_cache.add_argument("--market-slugs", required=True)
+    multi_strike_sweep_cache.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    multi_strike_sweep_cache.add_argument("--amount", type=float, default=5.0)
+    multi_strike_sweep_cache.add_argument("--vol-grid", default="0.4,0.6,0.8,1.0")
+    multi_strike_sweep_cache.add_argument("--annualized-vol", type=float, default=0.80)
+    multi_strike_sweep_cache.add_argument("--vol-mode", choices=["fixed", "realized"], default="fixed")
+    multi_strike_sweep_cache.add_argument("--vol-window-seconds", type=int, default=86_400)
+    multi_strike_sweep_cache.add_argument("--min-annualized-vol", type=float, default=0.20)
+    multi_strike_sweep_cache.add_argument("--max-annualized-vol", type=float, default=2.00)
+    multi_strike_sweep_cache.add_argument("--edge-grid", default="0.03,0.05,0.08,0.12")
+    multi_strike_sweep_cache.add_argument("--hold-grid", default="900,3600,14400")
+    multi_strike_sweep_cache.add_argument("--cost-cents-grid", default="0,1,2,3")
+    multi_strike_sweep_cache.add_argument("--interval", default="1m")
+    multi_strike_sweep_cache.add_argument("--spot-start-ts-ms", type=int, default=0)
+    multi_strike_sweep_cache.add_argument("--spot-end-ts-ms", type=int, default=0)
+    multi_strike_sweep_cache.add_argument("--min-trades", type=int, default=20)
+    multi_strike_sweep_cache.add_argument("--min-profit-factor", type=float, default=1.05)
+    multi_strike_sweep_cache.add_argument("--max-drawdown", type=float, default=10.0)
+    multi_strike_sweep_cache.add_argument("--sample-trades", type=int, default=3)
+    multi_strike_sweep_cache.add_argument("--top", type=int, default=20)
+    multi_strike_sweep_cache.add_argument("--output", default=None)
+    multi_strike_sweep_cache.add_argument("--csv-output", default=None)
+    multi_strike_sweep_cache.set_defaults(func=cmd_multi_strike)
 
     wallet_flow = sub.add_parser("wallet-flow")
     wallet_sub = wallet_flow.add_subparsers(dest="wallet_command", required=True)

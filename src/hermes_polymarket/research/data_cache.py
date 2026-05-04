@@ -91,6 +91,34 @@ class ResearchDataCache:
     def load_binance_klines(self, *, symbol: str, interval: str, start_ts_ms: int, end_ts_ms: int) -> list[dict[str, Any]]:
         return _read_jsonl(self.klines_path(symbol=symbol, interval=interval, start_ts_ms=start_ts_ms, end_ts_ms=end_ts_ms))
 
+    def load_gamma_market(self, *, slug: str) -> dict[str, Any] | None:
+        path = self.root / "gamma_markets" / f"{_safe(slug)}.json"
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text())
+        markets = payload.get("markets") if isinstance(payload, dict) else None
+        if not isinstance(markets, list) or not markets:
+            return None
+        return markets[0] if isinstance(markets[0], dict) else None
+
+    def find_binance_klines(self, *, symbol: str, interval: str, start_ts_ms: int, end_ts_ms: int) -> list[dict[str, Any]]:
+        prefix = f"{_safe(symbol.lower())}_{_safe(interval)}_"
+        rows: list[dict[str, Any]] = []
+        for path in (self.root / "binance_klines").glob(f"{prefix}*.jsonl"):
+            bounds = _parse_klines_bounds(path, prefix)
+            if bounds is None:
+                continue
+            file_start, file_end = bounds
+            if file_end < start_ts_ms or file_start > end_ts_ms:
+                continue
+            rows.extend(_read_jsonl(path))
+        dedup: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            ts = int(row.get("open_ts_ms") or row.get("open_time") or 0)
+            if start_ts_ms <= ts <= end_ts_ms:
+                dedup[ts] = row
+        return [dedup[key] for key in sorted(dedup)]
+
     def trades_path(self, condition_id: str) -> Path:
         return self.root / "polymarket_trades" / f"{_safe(condition_id)}.jsonl"
 
@@ -157,3 +185,17 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         if line.strip():
             out.append(json.loads(line))
     return out
+
+
+def _parse_klines_bounds(path: Path, prefix: str) -> tuple[int, int] | None:
+    stem = path.stem
+    if not stem.startswith(prefix):
+        return None
+    rest = stem[len(prefix) :]
+    parts = rest.rsplit("_", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
