@@ -1,0 +1,7 @@
+environment: "trading_real"
+mode: "trading_real"
+database_path: "data/trading_real/trading_real.sqlite3"
+artifact_dir: "artifacts/trading_real"
+allow_live_trading: false
+requires_pre_live_audit: true
+force_live_disabled: true

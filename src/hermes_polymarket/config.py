@@ -53,9 +53,12 @@ class Settings:
     polymarket_host: str
     polygon_chain_id: int
     mode: str
+    environment: str
     database_path: Path
+    artifact_dir: Path
     initial_bankroll: float
     allow_live_trading: bool
+    requires_pre_live_audit: bool
     private_key: str
     funder: str
     builder_code: str
@@ -79,24 +82,37 @@ class Settings:
 def load_settings(config_dir: Path | None = None) -> Settings:
     config_dir = config_dir or PROJECT_ROOT / "config"
     default = _read_yaml(config_dir / "default.yaml")
+    environment = os.getenv("HERMES_ENV", str(default.get("environment", "default"))).strip() or "default"
+    environment_config = _read_yaml(config_dir / f"{environment}.yaml") if environment != "default" else {}
+    merged = {**default, **environment_config}
     risk = _read_yaml(config_dir / "risk.yaml")
 
     db_path_value = (
         os.getenv("HERMES_DATABASE_PATH")
         or os.getenv("DATABASE_PATH")
-        or str(default.get("database_path", "data/hermes_polymarket.sqlite3"))
+        or str(merged.get("database_path", "data/hermes_polymarket.sqlite3"))
     )
     db_path = Path(db_path_value)
     if not db_path.is_absolute():
         db_path = PROJECT_ROOT / db_path
+    artifact_dir_value = os.getenv("HERMES_ARTIFACTS_DIR") or str(merged.get("artifact_dir", "artifacts"))
+    artifact_dir = Path(artifact_dir_value)
+    if not artifact_dir.is_absolute():
+        artifact_dir = PROJECT_ROOT / artifact_dir
+    allow_live = _env_bool("ALLOW_LIVE_TRADING", bool(merged.get("allow_live_trading", False)))
+    if bool(merged.get("force_live_disabled", False)):
+        allow_live = False
 
     return Settings(
-        polymarket_host=os.getenv("POLYMARKET_HOST", str(default.get("polymarket_host", "https://clob.polymarket.com"))),
-        polygon_chain_id=_env_int("POLYGON_CHAIN_ID", int(default.get("polygon_chain_id", 137))),
-        mode=os.getenv("MODE", str(default.get("mode", "paper"))),
+        polymarket_host=os.getenv("POLYMARKET_HOST", str(merged.get("polymarket_host", "https://clob.polymarket.com"))),
+        polygon_chain_id=_env_int("POLYGON_CHAIN_ID", int(merged.get("polygon_chain_id", 137))),
+        mode=os.getenv("MODE", str(merged.get("mode", "paper"))),
+        environment=environment,
         database_path=db_path,
-        initial_bankroll=_env_float("INITIAL_BANKROLL", float(default.get("initial_bankroll", 1000.0))),
-        allow_live_trading=_env_bool("ALLOW_LIVE_TRADING", bool(default.get("allow_live_trading", False))),
+        artifact_dir=artifact_dir,
+        initial_bankroll=_env_float("INITIAL_BANKROLL", float(merged.get("initial_bankroll", 1000.0))),
+        allow_live_trading=allow_live,
+        requires_pre_live_audit=bool(merged.get("requires_pre_live_audit", False)),
         private_key=os.getenv("POLYMARKET_PRIVATE_KEY", ""),
         funder=os.getenv("POLYMARKET_FUNDER", ""),
         builder_code=os.getenv("POLY_BUILDER_CODE", ""),

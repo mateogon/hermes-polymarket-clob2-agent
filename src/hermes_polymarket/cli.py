@@ -111,6 +111,101 @@ def cmd_live(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_environment_show(args: argparse.Namespace) -> int:
+    previous = os.environ.get("HERMES_ENV")
+    if args.env:
+        os.environ["HERMES_ENV"] = args.env
+    try:
+        settings = _settings()
+    finally:
+        if args.env:
+            if previous is None:
+                os.environ.pop("HERMES_ENV", None)
+            else:
+                os.environ["HERMES_ENV"] = previous
+    print(
+        json.dumps(
+            {
+                "environment": settings.environment,
+                "mode": settings.mode,
+                "database_path": str(settings.database_path),
+                "artifact_dir": str(settings.artifact_dir),
+                "allow_live_trading": settings.allow_live_trading,
+                "requires_pre_live_audit": settings.requires_pre_live_audit,
+                "data_quality": "environment_config",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_research(args: argparse.Namespace) -> int:
+    from hermes_polymarket.learning.research_ledger import (
+        experiment_report,
+        get_hypothesis,
+        list_hypotheses,
+        update_hypothesis,
+        upsert_hypothesis,
+    )
+
+    settings = _settings()
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        if args.research_command == "hypothesis":
+            if args.hypothesis_command == "add":
+                payload = upsert_hypothesis(
+                    db,
+                    hypothesis_id=args.id,
+                    strategy=args.strategy,
+                    market_family=args.market_family,
+                    claim=args.claim,
+                    status=args.status,
+                    data_quality=args.data_quality,
+                    evidence=json.loads(args.evidence_json),
+                    next_action=args.next_action,
+                    proposed_test=json.loads(args.proposed_test_json),
+                    result=json.loads(args.result_json),
+                )
+                print(json.dumps({"status": "stored", "environment": settings.environment, "hypothesis": payload}, indent=2, sort_keys=True))
+                return 0
+            if args.hypothesis_command == "list":
+                rows = list_hypotheses(db, status=args.status, limit=args.limit)
+                print(json.dumps({"environment": settings.environment, "hypotheses": rows}, indent=2, sort_keys=True))
+                return 0
+            if args.hypothesis_command == "show":
+                row = get_hypothesis(db, args.id)
+                if row is None:
+                    print(json.dumps({"status": "not_found", "hypothesis_id": args.id}, indent=2, sort_keys=True))
+                    return 2
+                print(json.dumps({"environment": settings.environment, "hypothesis": row}, indent=2, sort_keys=True))
+                return 0
+            if args.hypothesis_command == "update":
+                row = update_hypothesis(
+                    db,
+                    hypothesis_id=args.id,
+                    status=args.status,
+                    evidence=json.loads(args.evidence_json) if args.evidence_json else None,
+                    next_action=args.next_action,
+                    result=json.loads(args.result_json) if args.result_json else None,
+                )
+                if row is None:
+                    print(json.dumps({"status": "not_found", "hypothesis_id": args.id}, indent=2, sort_keys=True))
+                    return 2
+                print(json.dumps({"status": "updated", "environment": settings.environment, "hypothesis": row}, indent=2, sort_keys=True))
+                return 0
+        if args.research_command == "experiments" and args.experiments_command == "report":
+            report = experiment_report(db, limit=args.limit)
+            print(json.dumps({"environment": settings.environment, **report}, indent=2, sort_keys=True))
+            return 0
+    finally:
+        db.close()
+    print("unknown research command")
+    return 2
+
+
 def cmd_wallet_flow_report(args: argparse.Namespace) -> int:
     from hermes_polymarket.storage.wallet_flow import wallet_flow_metrics
 
@@ -3701,6 +3796,48 @@ def build_parser() -> argparse.ArgumentParser:
 
     smoke = sub.add_parser("smoke")
     smoke.set_defaults(func=cmd_smoke)
+
+    environment = sub.add_parser("environment")
+    environment_sub = environment.add_subparsers(dest="environment_command", required=True)
+    environment_show = environment_sub.add_parser("show")
+    environment_show.add_argument("--env", choices=["default", "research", "trading_real"], default=None)
+    environment_show.set_defaults(func=cmd_environment_show)
+
+    research = sub.add_parser("research")
+    research_sub = research.add_subparsers(dest="research_command", required=True)
+    research_hypothesis = research_sub.add_parser("hypothesis")
+    research_hypothesis_sub = research_hypothesis.add_subparsers(dest="hypothesis_command", required=True)
+    hyp_add = research_hypothesis_sub.add_parser("add")
+    hyp_add.add_argument("--id", required=True)
+    hyp_add.add_argument("--strategy", required=True)
+    hyp_add.add_argument("--market-family", required=True)
+    hyp_add.add_argument("--claim", required=True)
+    hyp_add.add_argument("--status", default="hypothesis")
+    hyp_add.add_argument("--data-quality", required=True)
+    hyp_add.add_argument("--evidence-json", default="{}")
+    hyp_add.add_argument("--next-action", default="")
+    hyp_add.add_argument("--proposed-test-json", default="{}")
+    hyp_add.add_argument("--result-json", default="{}")
+    hyp_add.set_defaults(func=cmd_research)
+    hyp_list = research_hypothesis_sub.add_parser("list")
+    hyp_list.add_argument("--status", default=None)
+    hyp_list.add_argument("--limit", type=int, default=50)
+    hyp_list.set_defaults(func=cmd_research)
+    hyp_show = research_hypothesis_sub.add_parser("show")
+    hyp_show.add_argument("--id", required=True)
+    hyp_show.set_defaults(func=cmd_research)
+    hyp_update = research_hypothesis_sub.add_parser("update")
+    hyp_update.add_argument("--id", required=True)
+    hyp_update.add_argument("--status", default=None)
+    hyp_update.add_argument("--evidence-json", default=None)
+    hyp_update.add_argument("--next-action", default=None)
+    hyp_update.add_argument("--result-json", default=None)
+    hyp_update.set_defaults(func=cmd_research)
+    research_experiments = research_sub.add_parser("experiments")
+    research_experiments_sub = research_experiments.add_subparsers(dest="experiments_command", required=True)
+    exp_report = research_experiments_sub.add_parser("report")
+    exp_report.add_argument("--limit", type=int, default=20)
+    exp_report.set_defaults(func=cmd_research)
 
     scan = sub.add_parser("scan")
     scan.add_argument("--mode", default="paper", choices=["paper", "dry-run", "live"])

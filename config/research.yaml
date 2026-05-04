@@ -1,0 +1,7 @@
+environment: "research"
+mode: "research"
+database_path: "data/research/research.sqlite3"
+artifact_dir: "artifacts/research"
+allow_live_trading: false
+requires_pre_live_audit: false
+force_live_disabled: true
