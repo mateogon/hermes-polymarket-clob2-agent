@@ -1,5 +1,6 @@
 from hermes_polymarket.backtest.multi_strike_historical_approx import (
     price_at_or_before,
+    realized_annualized_vol,
     replay_yes_trade_path,
     replay_yes_trade_path_with_spot,
 )
@@ -46,6 +47,15 @@ def test_price_at_or_before_uses_latest_available_spot():
     assert price_at_or_before([(1000, 10.0)], 500) is None
 
 
+def test_realized_annualized_vol_uses_prior_window_and_clamps():
+    spots = [(0, 100.0), (60_000, 101.0), (120_000, 99.0), (180_000, 102.0)]
+
+    vol = realized_annualized_vol(spots, 180_000, window_seconds=180, min_annualized_vol=0.2, max_annualized_vol=2.0)
+
+    assert vol is not None
+    assert 0.2 <= vol <= 2.0
+
+
 def test_replay_yes_trade_path_with_spot_recomputes_fair_value_per_entry():
     results, summary = replay_yes_trade_path_with_spot(
         [_trade(100, 0.10), _trade(200, 0.15), _trade(400, 0.20)],
@@ -64,6 +74,37 @@ def test_replay_yes_trade_path_with_spot_recomputes_fair_value_per_entry():
     assert len(results) == 1
     assert results[0].entry_spot == 78_000.0
     assert results[0].model_probability > 0
+    assert results[0].annualized_vol == 0.80
+
+
+def test_replay_yes_trade_path_with_spot_can_use_realized_vol():
+    results, summary = replay_yes_trade_path_with_spot(
+        [_trade(180, 0.10), _trade(300, 0.15), _trade(420, 0.20)],
+        token_id="yes-token",
+        spot_prices=[
+            (0, 78_000.0),
+            (60_000, 79_000.0),
+            (120_000, 77_500.0),
+            (180_000, 80_000.0),
+            (300_000, 81_000.0),
+            (420_000, 82_000.0),
+        ],
+        target_price=150_000.0,
+        expiry_ts_ms=200_000_000_000,
+        annualized_vol=0.80,
+        edge_threshold=0.01,
+        amount_usd=5.0,
+        hold_seconds=100,
+        dynamic_vol_window_seconds=180,
+        min_annualized_vol=0.2,
+        max_annualized_vol=2.0,
+    )
+
+    assert summary["vol_mode"] == "realized"
+    assert summary["avg_annualized_vol"] is not None
+    assert summary["avg_evaluated_annualized_vol"] is not None
+    assert len(results) >= 1
+    assert results[0].annualized_vol != 0.80
 
 
 def test_replay_yes_trade_path_with_spot_applies_cost_penalty():

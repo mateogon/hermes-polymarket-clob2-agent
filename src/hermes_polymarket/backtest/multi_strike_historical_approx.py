@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import log, sqrt
 from typing import Any
 
 from hermes_polymarket.crypto.multi_strike_fair_value import fair_value_target_hit
@@ -37,6 +38,7 @@ class MultiStrikeSpotReplayTrade:
     edge_at_entry: float
     model_probability: float
     seconds_to_expiry: float
+    annualized_vol: float
     fair_value_reason: str
     cost_cents: float = 0.0
 
@@ -111,6 +113,9 @@ def replay_yes_trade_path_with_spot(
     amount_usd: float,
     hold_seconds: int,
     cost_cents: float = 0.0,
+    dynamic_vol_window_seconds: int | None = None,
+    min_annualized_vol: float = 0.20,
+    max_annualized_vol: float = 2.00,
 ) -> tuple[list[MultiStrikeSpotReplayTrade], dict[str, Any]]:
     yes_trades = sorted(
         [trade for trade in trades if trade.asset_id == token_id and trade.outcome.lower() == "yes"],
@@ -118,7 +123,9 @@ def replay_yes_trade_path_with_spot(
     )
     spots = sorted((int(ts_ms), float(price)) for ts_ms, price in spot_prices if price > 0)
     results: list[MultiStrikeSpotReplayTrade] = []
+    evaluated_vols: list[float] = []
     skipped_no_spot = 0
+    skipped_no_vol = 0
     skipped_below_edge = 0
     idx = 0
     while idx < len(yes_trades):
@@ -128,12 +135,27 @@ def replay_yes_trade_path_with_spot(
             skipped_no_spot += 1
             idx += 1
             continue
+        selected_vol = annualized_vol
+        if dynamic_vol_window_seconds is not None:
+            realized = realized_annualized_vol(
+                spots,
+                entry.timestamp * 1000,
+                window_seconds=dynamic_vol_window_seconds,
+                min_annualized_vol=min_annualized_vol,
+                max_annualized_vol=max_annualized_vol,
+            )
+            if realized is None:
+                skipped_no_vol += 1
+                idx += 1
+                continue
+            selected_vol = realized
+        evaluated_vols.append(selected_vol)
         seconds_to_expiry = max(1.0, (expiry_ts_ms - entry.timestamp * 1000) / 1000.0)
         fv = fair_value_target_hit(
             current_price=spot,
             target_price=target_price,
             seconds_to_expiry=seconds_to_expiry,
-            annualized_vol=annualized_vol,
+            annualized_vol=selected_vol,
         )
         effective_entry_price = entry.price + cost_cents / 100.0
         edge = fv.probability_yes - effective_entry_price
@@ -164,6 +186,7 @@ def replay_yes_trade_path_with_spot(
                 edge_at_entry=edge,
                 model_probability=fv.probability_yes,
                 seconds_to_expiry=seconds_to_expiry,
+                annualized_vol=selected_vol,
                 fair_value_reason=fv.reason,
                 cost_cents=cost_cents,
             )
@@ -175,10 +198,39 @@ def replay_yes_trade_path_with_spot(
         observed_yes_trades=len(yes_trades),
         spot_points=len(spots),
         skipped_no_spot=skipped_no_spot,
+        skipped_no_vol=skipped_no_vol,
         skipped_below_edge=skipped_below_edge,
         cost_cents=cost_cents,
+        vol_mode="realized" if dynamic_vol_window_seconds is not None else "fixed",
+        vol_window_seconds=dynamic_vol_window_seconds,
+        evaluated_vols=evaluated_vols,
     )
     return results, summary
+
+
+def realized_annualized_vol(
+    spots: list[tuple[int, float]],
+    target_ts_ms: int,
+    *,
+    window_seconds: int,
+    min_annualized_vol: float = 0.20,
+    max_annualized_vol: float = 2.00,
+) -> float | None:
+    start_ts_ms = target_ts_ms - window_seconds * 1000
+    window = [(ts_ms, price) for ts_ms, price in spots if start_ts_ms <= ts_ms <= target_ts_ms and price > 0]
+    if len(window) < 3:
+        return None
+    returns = [log(window[idx][1] / window[idx - 1][1]) for idx in range(1, len(window)) if window[idx - 1][1] > 0]
+    if len(returns) < 2:
+        return None
+    mean = sum(returns) / len(returns)
+    variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
+    if variance <= 0:
+        return min_annualized_vol
+    avg_step_seconds = max((window[-1][0] - window[0][0]) / 1000.0 / (len(window) - 1), 1.0)
+    periods_per_year = 31_536_000 / avg_step_seconds
+    annualized = sqrt(variance) * sqrt(periods_per_year)
+    return max(min_annualized_vol, min(max_annualized_vol, annualized))
 
 
 def price_at_or_before(spots: list[tuple[int, float]], target_ts_ms: int) -> float | None:
@@ -197,7 +249,11 @@ def summarize_spot_replay(
     spot_points: int,
     skipped_no_spot: int,
     skipped_below_edge: int,
+    skipped_no_vol: int = 0,
     cost_cents: float = 0.0,
+    vol_mode: str = "fixed",
+    vol_window_seconds: int | None = None,
+    evaluated_vols: list[float] | None = None,
 ) -> dict[str, Any]:
     pnl = [row.pnl for row in results]
     wins = [value for value in pnl if value > 0]
@@ -217,8 +273,17 @@ def summarize_spot_replay(
         "spot_points": spot_points,
         "simulated_trades": len(results),
         "skipped_no_spot": skipped_no_spot,
+        "skipped_no_vol": skipped_no_vol,
         "skipped_below_edge": skipped_below_edge,
         "cost_cents": cost_cents,
+        "vol_mode": vol_mode,
+        "vol_window_seconds": vol_window_seconds,
+        "avg_evaluated_annualized_vol": sum(evaluated_vols) / len(evaluated_vols) if evaluated_vols else None,
+        "min_evaluated_annualized_vol": min(evaluated_vols) if evaluated_vols else None,
+        "max_evaluated_annualized_vol": max(evaluated_vols) if evaluated_vols else None,
+        "avg_annualized_vol": sum(row.annualized_vol for row in results) / len(results) if results else None,
+        "min_annualized_vol": min((row.annualized_vol for row in results), default=None),
+        "max_annualized_vol": max((row.annualized_vol for row in results), default=None),
         "net_pnl": sum(pnl),
         "win_rate": len(wins) / len(results) if results else 0.0,
         "avg_roi": sum(row.roi for row in results) / len(results) if results else 0.0,

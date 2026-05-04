@@ -2425,6 +2425,9 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
                 edge_threshold=args.edge_threshold,
                 amount_usd=args.amount,
                 hold_seconds=args.hold_seconds,
+                dynamic_vol_window_seconds=args.vol_window_seconds if args.vol_mode == "realized" else None,
+                min_annualized_vol=args.min_annualized_vol,
+                max_annualized_vol=args.max_annualized_vol,
             )
             payload = {
                 "mode": "multi_strike_historical_spot",
@@ -2437,6 +2440,8 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
                 "target_price": target.target_price,
                 "expiry_ts_ms": expiry_ts_ms,
                 "annualized_vol": args.annualized_vol,
+                "vol_mode": args.vol_mode,
+                "vol_window_seconds": args.vol_window_seconds if args.vol_mode == "realized" else None,
                 "summary": summary,
                 "trades": [row.to_dict() for row in results],
                 "warning": "Uses historical Binance candles and Polymarket trade prints; still not executable L2 truth.",
@@ -2460,7 +2465,7 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
         from hermes_polymarket.data_sources.polymarket_data_api import PolymarketDataApi
 
         market_slugs = [value.strip() for value in args.market_slugs.split(",") if value.strip()]
-        vols = [float(value) for value in args.vol_grid.split(",") if value.strip()]
+        vols = [float(value) for value in args.vol_grid.split(",") if value.strip()] if args.vol_mode == "fixed" else [args.annualized_vol]
         edges = [float(value) for value in args.edge_grid.split(",") if value.strip()]
         holds = [int(value) for value in args.hold_grid.split(",") if value.strip()]
         costs = [float(value) for value in args.cost_cents_grid.split(",") if value.strip()]
@@ -2533,6 +2538,9 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
                                     amount_usd=args.amount,
                                     hold_seconds=hold,
                                     cost_cents=cost,
+                                    dynamic_vol_window_seconds=args.vol_window_seconds if args.vol_mode == "realized" else None,
+                                    min_annualized_vol=args.min_annualized_vol,
+                                    max_annualized_vol=args.max_annualized_vol,
                                 )
                                 row = {
                                     "market_slug": market_slug,
@@ -2540,6 +2548,10 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
                                     "symbol": args.symbol,
                                     "target_price": target.target_price,
                                     "annualized_vol": vol,
+                                    "vol_mode": args.vol_mode,
+                                    "vol_window_seconds": args.vol_window_seconds if args.vol_mode == "realized" else None,
+                                    "avg_selected_vol": summary.get("avg_annualized_vol"),
+                                    "avg_evaluated_vol": summary.get("avg_evaluated_annualized_vol"),
                                     "edge_threshold": edge,
                                     "hold_seconds": hold,
                                     "cost_cents": cost,
@@ -2571,6 +2583,8 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
                 "market_slugs": market_slugs,
                 "grids": {
                     "annualized_vol": vols,
+                    "vol_mode": args.vol_mode,
+                    "vol_window_seconds": args.vol_window_seconds if args.vol_mode == "realized" else None,
                     "edge_threshold": edges,
                     "hold_seconds": holds,
                     "cost_cents": costs,
@@ -2594,6 +2608,10 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
                     "symbol",
                     "target_price",
                     "annualized_vol",
+                    "vol_mode",
+                    "vol_window_seconds",
+                    "avg_selected_vol",
+                    "avg_evaluated_vol",
                     "edge_threshold",
                     "hold_seconds",
                     "cost_cents",
@@ -3562,6 +3580,10 @@ def build_parser() -> argparse.ArgumentParser:
     multi_strike_spot.add_argument("--edge-threshold", type=float, default=0.08)
     multi_strike_spot.add_argument("--hold-seconds", type=int, default=3600)
     multi_strike_spot.add_argument("--annualized-vol", type=float, default=0.80)
+    multi_strike_spot.add_argument("--vol-mode", choices=["fixed", "realized"], default="fixed")
+    multi_strike_spot.add_argument("--vol-window-seconds", type=int, default=86_400)
+    multi_strike_spot.add_argument("--min-annualized-vol", type=float, default=0.20)
+    multi_strike_spot.add_argument("--max-annualized-vol", type=float, default=2.00)
     multi_strike_spot.add_argument("--interval", default="1m")
     multi_strike_spot.add_argument("--limit", type=int, default=500)
     multi_strike_spot.add_argument("--output", default=None)
@@ -3571,6 +3593,11 @@ def build_parser() -> argparse.ArgumentParser:
     multi_strike_sweep.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
     multi_strike_sweep.add_argument("--amount", type=float, default=5.0)
     multi_strike_sweep.add_argument("--vol-grid", default="0.4,0.6,0.8,1.0")
+    multi_strike_sweep.add_argument("--annualized-vol", type=float, default=0.80)
+    multi_strike_sweep.add_argument("--vol-mode", choices=["fixed", "realized"], default="fixed")
+    multi_strike_sweep.add_argument("--vol-window-seconds", type=int, default=86_400)
+    multi_strike_sweep.add_argument("--min-annualized-vol", type=float, default=0.20)
+    multi_strike_sweep.add_argument("--max-annualized-vol", type=float, default=2.00)
     multi_strike_sweep.add_argument("--edge-grid", default="0.03,0.05,0.08,0.12")
     multi_strike_sweep.add_argument("--hold-grid", default="900,3600,14400")
     multi_strike_sweep.add_argument("--cost-cents-grid", default="0,1,2,3")
