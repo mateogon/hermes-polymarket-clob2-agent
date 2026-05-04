@@ -2351,6 +2351,108 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
             gamma.close()
             data_api.close()
 
+    if args.multi_strike_command == "historical-spot":
+        from hermes_polymarket.backtest.multi_strike_historical_approx import replay_yes_trade_path_with_spot
+        from hermes_polymarket.crypto.multi_strike_market import parse_multi_strike_target
+        from hermes_polymarket.data_sources.binance_historical import BinanceHistoricalClient
+        from hermes_polymarket.data_sources.polymarket_data_api import PolymarketDataApi
+
+        gamma = GammaClient()
+        data_api = PolymarketDataApi()
+        binance = BinanceHistoricalClient()
+        try:
+            markets = gamma.markets_by_slug(args.market_slug)
+            if not markets:
+                print(json.dumps({"status": "market_not_found", "market_slug": args.market_slug}, indent=2, sort_keys=True))
+                return 2
+            market = markets[0]
+            condition_id = str(market.get("conditionId") or market.get("condition_id") or "")
+            tokens = json.loads(market.get("clobTokenIds") or "[]") if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds") or []
+            yes_token = str(tokens[0]) if tokens else ""
+            end_date = market.get("endDate")
+            if not end_date:
+                print(json.dumps({"status": "missing_end_date", "market_slug": args.market_slug}, indent=2, sort_keys=True))
+                return 2
+            parsed_end = datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+            if parsed_end.tzinfo is None:
+                parsed_end = parsed_end.replace(tzinfo=timezone.utc)
+            expiry_ts_ms = int(parsed_end.timestamp() * 1000)
+
+            trades = data_api.get_trades(market=condition_id, limit=args.limit)
+            if not trades:
+                print(
+                    json.dumps(
+                        {
+                            "mode": "multi_strike_historical_spot",
+                            "data_quality": "historical_spot_fair_value",
+                            "market_slug": args.market_slug,
+                            "condition_id": condition_id,
+                            "summary": {"observed_yes_trades": 0, "simulated_trades": 0},
+                            "warning": "No Data API trades returned for market.",
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                return 0
+
+            min_trade_ts_ms = min(trade.timestamp for trade in trades) * 1000
+            max_trade_ts_ms = max(trade.timestamp for trade in trades) * 1000
+            candle_start = max(0, min_trade_ts_ms - 60_000)
+            candle_end = max_trade_ts_ms + max(args.hold_seconds * 1000, 60_000)
+            candles = binance.get_klines_paginated(
+                symbol=args.symbol,
+                interval=args.interval,
+                start_ts_ms=candle_start,
+                end_ts_ms=candle_end,
+            )
+            if not candles:
+                print(json.dumps({"status": "no_spot_candles", "symbol": args.symbol, "start_ts_ms": candle_start, "end_ts_ms": candle_end}, indent=2, sort_keys=True))
+                return 2
+
+            first_spot = candles[0].close
+            target = parse_multi_strike_target(f"{market.get('question') or ''} {market.get('slug') or ''}", current_price=first_spot)
+            if target is None:
+                print(json.dumps({"status": "target_parse_failed", "market_slug": args.market_slug}, indent=2, sort_keys=True))
+                return 2
+            results, summary = replay_yes_trade_path_with_spot(
+                trades,
+                token_id=yes_token,
+                spot_prices=[(candle.open_ts_ms, candle.close) for candle in candles],
+                target_price=target.target_price,
+                expiry_ts_ms=expiry_ts_ms,
+                annualized_vol=args.annualized_vol,
+                edge_threshold=args.edge_threshold,
+                amount_usd=args.amount,
+                hold_seconds=args.hold_seconds,
+            )
+            payload = {
+                "mode": "multi_strike_historical_spot",
+                "data_quality": "historical_spot_fair_value",
+                "market_slug": args.market_slug,
+                "condition_id": condition_id,
+                "symbol": args.symbol,
+                "spot_source": "binance_klines",
+                "spot_interval": args.interval,
+                "target_price": target.target_price,
+                "expiry_ts_ms": expiry_ts_ms,
+                "annualized_vol": args.annualized_vol,
+                "summary": summary,
+                "trades": [row.to_dict() for row in results],
+                "warning": "Uses historical Binance candles and Polymarket trade prints; still not executable L2 truth.",
+            }
+            if args.output:
+                path = Path(args.output)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                payload["output"] = str(path)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        finally:
+            gamma.close()
+            data_api.close()
+            binance.close()
+
     print(f"unknown multi-strike command: {args.multi_strike_command}")
     return 2
 
@@ -3285,6 +3387,17 @@ def build_parser() -> argparse.ArgumentParser:
     multi_strike_hist.add_argument("--limit", type=int, default=500)
     multi_strike_hist.add_argument("--output", default=None)
     multi_strike_hist.set_defaults(func=cmd_multi_strike)
+    multi_strike_spot = multi_strike_sub.add_parser("historical-spot")
+    multi_strike_spot.add_argument("--market-slug", required=True)
+    multi_strike_spot.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    multi_strike_spot.add_argument("--amount", type=float, default=5.0)
+    multi_strike_spot.add_argument("--edge-threshold", type=float, default=0.08)
+    multi_strike_spot.add_argument("--hold-seconds", type=int, default=3600)
+    multi_strike_spot.add_argument("--annualized-vol", type=float, default=0.80)
+    multi_strike_spot.add_argument("--interval", default="1m")
+    multi_strike_spot.add_argument("--limit", type=int, default=500)
+    multi_strike_spot.add_argument("--output", default=None)
+    multi_strike_spot.set_defaults(func=cmd_multi_strike)
 
     wallet_flow = sub.add_parser("wallet-flow")
     wallet_sub = wallet_flow.add_subparsers(dest="wallet_command", required=True)
