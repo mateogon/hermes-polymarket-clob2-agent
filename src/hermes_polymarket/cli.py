@@ -208,6 +208,10 @@ def cmd_research(args: argparse.Namespace) -> int:
             payload = _research_market_families_command(args)
             print(json.dumps({"environment": settings.environment, **payload}, indent=2, sort_keys=True))
             return 0
+        if args.research_command == "candidate-batch":
+            payload = _research_candidate_batch_command(args)
+            print(json.dumps({"environment": settings.environment, **payload}, indent=2, sort_keys=True))
+            return 0
     finally:
         db.close()
     print("unknown research command")
@@ -307,6 +311,31 @@ def _research_market_families_command(args: argparse.Namespace) -> dict[str, Any
             prices = json.loads(args.current_prices_json)
         return scan_market_families(markets, current_prices=prices, limit=args.limit)
     return {"mode": "research_market_family", "status": "unknown_command"}
+
+
+def _research_candidate_batch_command(args: argparse.Namespace) -> dict[str, Any]:
+    from hermes_polymarket.research.candidate_batch import CandidateBatchConfig, run_research_candidate_batch
+
+    config = CandidateBatchConfig(
+        symbols=tuple(value.strip() for value in args.symbols.split(",") if value.strip()),
+        families=tuple(value.strip() for value in args.families.split(",") if value.strip()),
+        limit_events=args.limit_events,
+        limit_markets=args.limit_markets,
+        candidate_limit=args.candidate_limit,
+        trades_limit=args.trades_limit,
+        vol_mode=args.vol_mode,
+        vol_grid=tuple(float(value) for value in args.vol_grid.split(",") if value.strip()),
+        annualized_vol=args.annualized_vol,
+        edge_grid=tuple(float(value) for value in args.edge_grid.split(",") if value.strip()),
+        hold_grid=tuple(int(value) for value in args.hold_grid.split(",") if value.strip()),
+        cost_cents_grid=tuple(float(value) for value in args.cost_cents_grid.split(",") if value.strip()),
+        min_trades=args.min_trades,
+        min_profit_factor=args.min_profit_factor,
+        max_drawdown=args.max_drawdown,
+        min_cost_survival_cents=args.min_cost_survival_cents,
+        output_dir=Path(args.output_dir) if args.output_dir else None,
+    )
+    return run_research_candidate_batch(config=config)
 
 
 def cmd_wallet_flow_report(args: argparse.Namespace) -> int:
@@ -2394,15 +2423,33 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
         if not isinstance(rows, list):
             print(json.dumps({"status": "invalid_sweep", "file": str(sweep_path)}, indent=2, sort_keys=True))
             return 2
+        pre_rejected: list[dict[str, Any]] = []
+        pre_rejected_by_reason: dict[str, int] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            reasons = _promotion_prescreen_reasons(row, args)
+            if not reasons:
+                continue
+            for reason in reasons:
+                pre_rejected_by_reason[reason] = pre_rejected_by_reason.get(reason, 0) + 1
+            if len(pre_rejected) < 20:
+                pre_rejected.append(
+                    {
+                        "market_slug": row.get("market_slug"),
+                        "symbol": row.get("symbol") or args.symbol,
+                        "cost_cents": row.get("cost_cents"),
+                        "simulated_trades": row.get("simulated_trades"),
+                        "net_pnl": row.get("net_pnl"),
+                        "passes_promotion_gate": row.get("passes_promotion_gate"),
+                        "reasons": reasons,
+                    }
+                )
         candidate_rows = [
             row
             for row in rows
             if isinstance(row, dict)
-            and bool(row.get("passes_promotion_gate"))
-            and float(row.get("cost_cents") or 0.0) >= args.min_cost_cents
-            and float(row.get("cost_cents") or 0.0) <= args.max_cost_cents
-            and int(row.get("simulated_trades") or 0) >= args.min_trades
-            and float(row.get("net_pnl") or 0.0) >= args.min_net_pnl
+            and not _promotion_prescreen_reasons(row, args)
         ]
         seen_slugs: set[str] = set()
         candidate_rows = [
@@ -2420,6 +2467,15 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
         promoted: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
         try:
+            if not candidate_rows:
+                rejected.append(
+                    {
+                        "reason": "no_rows_after_cost_survival_filter",
+                        "rows_seen": len([row for row in rows if isinstance(row, dict)]),
+                        "rejected_by_reason": pre_rejected_by_reason,
+                        "sample": pre_rejected,
+                    }
+                )
             for row in candidate_rows:
                 slug = str(row.get("market_slug") or "")
                 symbol = str(row.get("symbol") or args.symbol)
@@ -2519,6 +2575,8 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
                 },
                 "promoted": promoted,
                 "rejected": rejected,
+                "pre_rejected_by_reason": pre_rejected_by_reason,
+                "pre_rejected_sample": pre_rejected,
                 "recommendation": "run_forward_paper_only_for_promoted_candidates",
             }
             if args.hypothesis_id:
@@ -3223,6 +3281,22 @@ def _market_event_slug(market: dict[str, Any]) -> str | None:
         if isinstance(first, dict) and first.get("slug"):
             return str(first["slug"])
     return None
+
+
+def _promotion_prescreen_reasons(row: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    reasons: list[str] = []
+    if not bool(row.get("passes_promotion_gate")):
+        reasons.append("historical_promotion_gate_false")
+    cost = float(row.get("cost_cents") or 0.0)
+    if cost < args.min_cost_cents:
+        reasons.append("cost_below_min_cost_cents")
+    if cost > args.max_cost_cents:
+        reasons.append("cost_above_max_cost_cents")
+    if int(row.get("simulated_trades") or 0) < args.min_trades:
+        reasons.append("insufficient_simulated_trades")
+    if float(row.get("net_pnl") or 0.0) < args.min_net_pnl:
+        reasons.append("net_pnl_below_min")
+    return reasons
 
 
 def _record_promotion_report(settings: Any, hypothesis_id: str, payload: dict[str, Any]) -> None:
@@ -4221,6 +4295,25 @@ def build_parser() -> argparse.ArgumentParser:
     family_scan.add_argument("--current-prices-json", default="")
     family_scan.add_argument("--limit", type=int, default=100)
     family_scan.set_defaults(func=cmd_research)
+    candidate_batch = research_sub.add_parser("candidate-batch")
+    candidate_batch.add_argument("--symbols", default="btcusdt,ethusdt,solusdt,xrpusdt")
+    candidate_batch.add_argument("--families", default="target_hit,dip_to")
+    candidate_batch.add_argument("--limit-events", type=int, default=1000)
+    candidate_batch.add_argument("--limit-markets", type=int, default=1000)
+    candidate_batch.add_argument("--candidate-limit", type=int, default=20)
+    candidate_batch.add_argument("--trades-limit", type=int, default=500)
+    candidate_batch.add_argument("--vol-mode", choices=["fixed", "realized"], default="realized")
+    candidate_batch.add_argument("--vol-grid", default="0.6,0.8,1.0,1.5")
+    candidate_batch.add_argument("--annualized-vol", type=float, default=0.80)
+    candidate_batch.add_argument("--edge-grid", default="0.00,0.01,0.03,0.05")
+    candidate_batch.add_argument("--hold-grid", default="900,3600,14400")
+    candidate_batch.add_argument("--cost-cents-grid", default="0,1,2")
+    candidate_batch.add_argument("--min-trades", type=int, default=10)
+    candidate_batch.add_argument("--min-profit-factor", type=float, default=1.05)
+    candidate_batch.add_argument("--max-drawdown", type=float, default=10.0)
+    candidate_batch.add_argument("--min-cost-survival-cents", type=float, default=1.0)
+    candidate_batch.add_argument("--output-dir", default=None)
+    candidate_batch.set_defaults(func=cmd_research)
 
     scan = sub.add_parser("scan")
     scan.add_argument("--mode", default="paper", choices=["paper", "dry-run", "live"])

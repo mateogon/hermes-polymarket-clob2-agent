@@ -50,6 +50,8 @@ def test_multi_strike_promote_records_rejection_in_research_ledger(monkeypatch, 
     promoted = json.loads(capsys.readouterr().out)
     assert promoted["hypothesis_id"] == "h-promote"
     assert promoted["promoted"] == []
+    assert promoted["rejected"][0]["reason"] == "no_rows_after_cost_survival_filter"
+    assert promoted["pre_rejected_by_reason"]["historical_promotion_gate_false"] == 1
 
     assert cli.main(["research", "hypothesis", "show", "--id", "h-promote"]) == 0
     shown = json.loads(capsys.readouterr().out)
