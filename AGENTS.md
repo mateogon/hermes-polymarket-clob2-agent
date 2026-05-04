@@ -57,6 +57,58 @@ Refusing live trading: ALLOW_LIVE_TRADING is not true
 6. Write generated run artifacts under `artifacts/runs/<run_id>/`.
 7. Do not commit artifacts, local DBs, logs, or secrets.
 
+## Long-Running Paper/Research Jobs
+
+When launching long-running paper or research jobs, do not rely on a fragile
+interactive shell wrapper. Jobs that are expected to outlive the current command
+turn must follow this checklist:
+
+1. Use `nohup` or another detached runner.
+2. Use absolute paths for the Python binary, log files, DB paths, artifact paths,
+   and working directory-sensitive inputs.
+3. Pass per-run DB paths with `HERMES_DATABASE_PATH=/absolute/path/to/run.sqlite3`.
+4. Redirect stdout/stderr to a concrete log file before backgrounding.
+5. Write a manifest next to the logs with:
+   - command purpose
+   - started_at
+   - expected_end_at
+   - PIDs
+   - log paths
+   - DB paths
+   - exact command or enough args to reconstruct it
+6. After 2-5 seconds, verify:
+   - PIDs are still running with `ps -p ...`
+   - log files exist
+   - DB/artifact files exist if the command should create them early
+7. If a process exits immediately, inspect the log and report that as a failed
+   launch. Do not count it as a completed experiment.
+8. For runs longer than a few minutes, create a thread reminder/heartbeat for
+   the expected end time and include the manifest/log paths in the reminder.
+9. Never run `watch-v2`, multi-strike paper, or campaign batches without
+   preserving enough logs and manifest data to audit whether the run actually
+   started.
+
+Minimal pattern:
+
+```bash
+ROOT="$PWD/logs/<campaign>/<timestamp>"
+DATAROOT="$PWD/data/<campaign>/<timestamp>"
+mkdir -p "$ROOT" "$DATAROOT"
+
+nohup env HERMES_DATABASE_PATH="$DATAROOT/run.sqlite3" \
+  "$PWD/.venv/bin/python" -m hermes_polymarket.cli ... \
+  > "$ROOT/run.log" 2>&1 &
+PID=$!
+
+printf '{"pid":%s,"log":"%s","db":"%s"}\n' \
+  "$PID" "$ROOT/run.log" "$DATAROOT/run.sqlite3" \
+  > "$ROOT/manifest.json"
+
+sleep 2
+ps -p "$PID"
+test -f "$ROOT/run.log"
+```
+
 ## Data Quality Labels
 
 ```text
