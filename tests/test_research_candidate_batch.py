@@ -19,6 +19,18 @@ def _market():
     }
 
 
+def _dip_market():
+    return {
+        "active": True,
+        "closed": False,
+        "question": "Will Bitcoin dip to $90 by December 31, 2026?",
+        "slug": "bitcoin-dip-to-90",
+        "conditionId": "condition",
+        "clobTokenIds": json.dumps(["yes-token", "no-token"]),
+        "endDate": "2026-12-31T00:00:00Z",
+    }
+
+
 def _trade(ts: int, price: float) -> WalletTrade:
     raw = {
         "proxyWallet": "0xabc",
@@ -34,15 +46,18 @@ def _trade(ts: int, price: float) -> WalletTrade:
 
 
 class FakeGamma:
+    def __init__(self, market=None):
+        self.market = market or _market()
+
     def list_events(self, **_):
         return []
 
     def list_markets(self, **_):
-        return [_market()]
+        return [self.market]
 
     def markets_by_slug(self, slug):
-        assert slug == "bitcoin-hit-110"
-        return [_market()]
+        assert slug == self.market["slug"]
+        return [self.market]
 
     def close(self):
         pass
@@ -94,6 +109,36 @@ def test_research_candidate_batch_runs_cache_and_sweep(tmp_path):
     assert payload["sweeps_run"] == 1
     assert payload["candidate_reports"][0]["top"]["net_pnl"] > 0
     assert (tmp_path / "out" / "summary.json").exists()
+
+
+def test_research_candidate_batch_runs_dip_to_sweep(tmp_path):
+    payload = run_research_candidate_batch(
+        config=CandidateBatchConfig(
+            symbols=("btcusdt",),
+            families=("dip_to",),
+            candidate_limit=1,
+            min_trades=1,
+            vol_mode="fixed",
+            vol_grid=(2.0,),
+            edge_grid=(0.0,),
+            hold_grid=(60,),
+            cost_cents_grid=(0.0,),
+            output_dir=tmp_path / "out",
+        ),
+        cache=ResearchDataCache(tmp_path / "cache"),
+        gamma=FakeGamma(_dip_market()),
+        data_api=FakeDataApi(),
+        binance=FakeBinance(),
+    )
+
+    report = payload["candidate_reports"][0]
+    assert payload["candidates_found"] == 1
+    assert payload["sweeps_run"] == 1
+    assert report["family"] == "dip_to"
+    assert report["market"]["target_direction"] == "below"
+    assert report["top"]["family"] == "dip_to"
+    assert report["top"]["target_direction"] == "below"
+    assert report["rejected_reason"] != "family_sweep_not_supported_yet"
 
 
 def test_research_candidate_batch_cli(monkeypatch, tmp_path, capsys):

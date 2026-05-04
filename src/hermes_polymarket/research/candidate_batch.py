@@ -15,12 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from hermes_polymarket.backtest.multi_strike_historical_approx import SpotSeries, replay_yes_trade_path_with_spot
-from hermes_polymarket.crypto.multi_strike_market import parse_multi_strike_target
+from hermes_polymarket.crypto.multi_strike_market import MultiStrikeTargetInfo, parse_multi_strike_target
 from hermes_polymarket.data_sources.binance_historical import BinanceHistoricalClient
 from hermes_polymarket.data_sources.polymarket_data_api import PolymarketDataApi
 from hermes_polymarket.polymarket.gamma_client import GammaClient
 from hermes_polymarket.research.data_cache import ResearchDataCache
-from hermes_polymarket.research.market_families import scan_market_families
+from hermes_polymarket.research.market_families import classify_market_family, scan_market_families
 
 
 @dataclass(frozen=True)
@@ -152,7 +152,7 @@ def _run_candidate(
     symbol = str(candidate.get("symbol") or "")
     family = str(candidate.get("family") or "")
     report: dict[str, Any] = {"slug": slug, "symbol": symbol, "family": family}
-    if family not in {"target_hit"}:
+    if family not in {"target_hit", "dip_to"}:
         return {**report, "rejected_reason": "family_sweep_not_supported_yet"}
     markets = gamma.markets_by_slug(slug)
     cache.write_gamma_market(slug=slug, markets=markets, params={"slug": slug})
@@ -192,6 +192,7 @@ def _run_candidate(
         candles=[(candle.open_ts_ms, candle.close) for candle in candles],
         yes_token=yes_token,
         symbol=symbol,
+        family=family,
         config=config,
     )
     ranked = sorted(
@@ -246,6 +247,7 @@ def _sweep_market_from_cached_inputs(
     candles: list[tuple[int, float]],
     yes_token: str,
     symbol: str,
+    family: str,
     config: CandidateBatchConfig,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     end_date = market.get("endDate")
@@ -255,7 +257,7 @@ def _sweep_market_from_cached_inputs(
     if parsed_end.tzinfo is None:
         parsed_end = parsed_end.replace(tzinfo=timezone.utc)
     expiry_ts_ms = int(parsed_end.timestamp() * 1000)
-    target = parse_multi_strike_target(f"{market.get('question') or ''} {market.get('slug') or ''}", current_price=candles[0][1])
+    target = _target_info_for_market(market, current_price=candles[0][1])
     if target is None:
         return [], {"market_slug": market.get("slug"), "status": "target_parse_failed"}
     rows: list[dict[str, Any]] = []
@@ -300,7 +302,9 @@ def _sweep_market_from_cached_inputs(
                         "market_slug": market.get("slug"),
                         "condition_id": market.get("conditionId") or market.get("condition_id"),
                         "symbol": symbol,
+                        "family": family,
                         "target_price": target.target_price,
+                        "target_direction": target.target_direction,
                         "annualized_vol": vol,
                         "vol_mode": config.vol_mode,
                         "vol_window_seconds": config.vol_window_seconds if config.vol_mode == "realized" else None,
@@ -321,11 +325,26 @@ def _sweep_market_from_cached_inputs(
     return rows, {
         "market_slug": market.get("slug"),
         "condition_id": market.get("conditionId") or market.get("condition_id"),
+        "family": family,
         "target_price": target.target_price,
+        "target_direction": target.target_direction,
         "observed_trades": len(trades),
         "spot_points": len(candles),
         "status": "ok",
     }
+
+
+def _target_info_for_market(market: dict[str, Any], *, current_price: float) -> MultiStrikeTargetInfo | None:
+    text = f"{market.get('question') or market.get('title') or ''} {market.get('slug') or ''}"
+    classified = classify_market_family(text, current_price=current_price)
+    if classified.family in {"target_hit", "dip_to"} and classified.target_price:
+        direction = classified.comparator or ("below" if classified.family == "dip_to" else "unknown")
+        return MultiStrikeTargetInfo(
+            market_type="multi_strike_event",
+            target_price=float(classified.target_price),
+            target_direction=direction,
+        )
+    return parse_multi_strike_target(text, current_price=current_price)
 
 
 def _fetch_universe(gamma: GammaClient, *, config: CandidateBatchConfig) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -390,7 +409,19 @@ def _token_ids(market: dict[str, Any]) -> tuple[str, ...]:
 def _small_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
     if row is None:
         return None
-    keys = ("market_slug", "cost_cents", "edge_threshold", "hold_seconds", "simulated_trades", "net_pnl", "profit_factor", "max_drawdown", "passes_promotion_gate")
+    keys = (
+        "market_slug",
+        "family",
+        "target_direction",
+        "cost_cents",
+        "edge_threshold",
+        "hold_seconds",
+        "simulated_trades",
+        "net_pnl",
+        "profit_factor",
+        "max_drawdown",
+        "passes_promotion_gate",
+    )
     return {key: row.get(key) for key in keys}
 
 
@@ -404,7 +435,9 @@ def _write_sweep_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fieldnames = [
         "market_slug",
         "symbol",
+        "family",
         "target_price",
+        "target_direction",
         "annualized_vol",
         "vol_mode",
         "edge_threshold",
