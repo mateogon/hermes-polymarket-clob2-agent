@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from math import log, sqrt
 from typing import Any
@@ -44,6 +45,46 @@ class MultiStrikeSpotReplayTrade:
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__
+
+
+class SpotSeries:
+    def __init__(self, spot_prices: list[tuple[int, float]]):
+        self.points = sorted((int(ts_ms), float(price)) for ts_ms, price in spot_prices if price > 0)
+        self.timestamps = [ts_ms for ts_ms, _ in self.points]
+        self.prices = [price for _, price in self.points]
+
+    def price_at_or_before(self, target_ts_ms: int) -> float | None:
+        idx = bisect_right(self.timestamps, target_ts_ms) - 1
+        if idx < 0:
+            return None
+        return self.prices[idx]
+
+    def realized_annualized_vol(
+        self,
+        target_ts_ms: int,
+        *,
+        window_seconds: int,
+        min_annualized_vol: float = 0.20,
+        max_annualized_vol: float = 2.00,
+    ) -> float | None:
+        start_ts_ms = target_ts_ms - window_seconds * 1000
+        start_idx = bisect_left(self.timestamps, start_ts_ms)
+        end_idx = bisect_right(self.timestamps, target_ts_ms)
+        if end_idx - start_idx < 3:
+            return None
+        window_timestamps = self.timestamps[start_idx:end_idx]
+        window_prices = self.prices[start_idx:end_idx]
+        returns = [log(window_prices[idx] / window_prices[idx - 1]) for idx in range(1, len(window_prices)) if window_prices[idx - 1] > 0]
+        if len(returns) < 2:
+            return None
+        mean = sum(returns) / len(returns)
+        variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
+        if variance <= 0:
+            return min_annualized_vol
+        avg_step_seconds = max((window_timestamps[-1] - window_timestamps[0]) / 1000.0 / (len(window_timestamps) - 1), 1.0)
+        periods_per_year = 31_536_000 / avg_step_seconds
+        annualized = sqrt(variance) * sqrt(periods_per_year)
+        return max(min_annualized_vol, min(max_annualized_vol, annualized))
 
 
 def replay_yes_trade_path(
@@ -116,12 +157,13 @@ def replay_yes_trade_path_with_spot(
     dynamic_vol_window_seconds: int | None = None,
     min_annualized_vol: float = 0.20,
     max_annualized_vol: float = 2.00,
+    dynamic_vol_by_ts_ms: dict[int, float] | None = None,
 ) -> tuple[list[MultiStrikeSpotReplayTrade], dict[str, Any]]:
     yes_trades = sorted(
         [trade for trade in trades if trade.asset_id == token_id and trade.outcome.lower() == "yes"],
         key=lambda trade: trade.timestamp,
     )
-    spots = sorted((int(ts_ms), float(price)) for ts_ms, price in spot_prices if price > 0)
+    spots = SpotSeries(spot_prices)
     results: list[MultiStrikeSpotReplayTrade] = []
     evaluated_vols: list[float] = []
     skipped_no_spot = 0
@@ -130,20 +172,22 @@ def replay_yes_trade_path_with_spot(
     idx = 0
     while idx < len(yes_trades):
         entry = yes_trades[idx]
-        spot = price_at_or_before(spots, entry.timestamp * 1000)
+        entry_ts_ms = entry.timestamp * 1000
+        spot = spots.price_at_or_before(entry_ts_ms)
         if spot is None:
             skipped_no_spot += 1
             idx += 1
             continue
         selected_vol = annualized_vol
         if dynamic_vol_window_seconds is not None:
-            realized = realized_annualized_vol(
-                spots,
-                entry.timestamp * 1000,
-                window_seconds=dynamic_vol_window_seconds,
-                min_annualized_vol=min_annualized_vol,
-                max_annualized_vol=max_annualized_vol,
-            )
+            realized = dynamic_vol_by_ts_ms.get(entry_ts_ms) if dynamic_vol_by_ts_ms is not None else None
+            if realized is None:
+                realized = spots.realized_annualized_vol(
+                    entry_ts_ms,
+                    window_seconds=dynamic_vol_window_seconds,
+                    min_annualized_vol=min_annualized_vol,
+                    max_annualized_vol=max_annualized_vol,
+                )
             if realized is None:
                 skipped_no_vol += 1
                 idx += 1
@@ -196,7 +240,7 @@ def replay_yes_trade_path_with_spot(
     summary = summarize_spot_replay(
         results,
         observed_yes_trades=len(yes_trades),
-        spot_points=len(spots),
+        spot_points=len(spots.points),
         skipped_no_spot=skipped_no_spot,
         skipped_no_vol=skipped_no_vol,
         skipped_below_edge=skipped_below_edge,
@@ -216,30 +260,16 @@ def realized_annualized_vol(
     min_annualized_vol: float = 0.20,
     max_annualized_vol: float = 2.00,
 ) -> float | None:
-    start_ts_ms = target_ts_ms - window_seconds * 1000
-    window = [(ts_ms, price) for ts_ms, price in spots if start_ts_ms <= ts_ms <= target_ts_ms and price > 0]
-    if len(window) < 3:
-        return None
-    returns = [log(window[idx][1] / window[idx - 1][1]) for idx in range(1, len(window)) if window[idx - 1][1] > 0]
-    if len(returns) < 2:
-        return None
-    mean = sum(returns) / len(returns)
-    variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
-    if variance <= 0:
-        return min_annualized_vol
-    avg_step_seconds = max((window[-1][0] - window[0][0]) / 1000.0 / (len(window) - 1), 1.0)
-    periods_per_year = 31_536_000 / avg_step_seconds
-    annualized = sqrt(variance) * sqrt(periods_per_year)
-    return max(min_annualized_vol, min(max_annualized_vol, annualized))
+    return SpotSeries(spots).realized_annualized_vol(
+        target_ts_ms,
+        window_seconds=window_seconds,
+        min_annualized_vol=min_annualized_vol,
+        max_annualized_vol=max_annualized_vol,
+    )
 
 
 def price_at_or_before(spots: list[tuple[int, float]], target_ts_ms: int) -> float | None:
-    best: float | None = None
-    for ts_ms, price in spots:
-        if ts_ms > target_ts_ms:
-            break
-        best = price
-    return best
+    return SpotSeries(spots).price_at_or_before(target_ts_ms)
 
 
 def summarize_spot_replay(

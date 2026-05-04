@@ -2459,7 +2459,7 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
             binance.close()
 
     if args.multi_strike_command == "sweep":
-        from hermes_polymarket.backtest.multi_strike_historical_approx import replay_yes_trade_path_with_spot
+        from hermes_polymarket.backtest.multi_strike_historical_approx import SpotSeries, replay_yes_trade_path_with_spot
         from hermes_polymarket.crypto.multi_strike_market import parse_multi_strike_target
         from hermes_polymarket.data_sources.binance_historical import BinanceHistoricalClient
         from hermes_polymarket.data_sources.polymarket_data_api import PolymarketDataApi
@@ -2523,6 +2523,22 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
                     }
                 )
                 spot_prices = [(candle.open_ts_ms, candle.close) for candle in candles]
+                dynamic_vol_by_ts_ms = None
+                if args.vol_mode == "realized":
+                    spot_series = SpotSeries(spot_prices)
+                    dynamic_vol_by_ts_ms = {
+                        trade.timestamp * 1000: vol
+                        for trade in trades
+                        if (
+                            vol := spot_series.realized_annualized_vol(
+                                trade.timestamp * 1000,
+                                window_seconds=args.vol_window_seconds,
+                                min_annualized_vol=args.min_annualized_vol,
+                                max_annualized_vol=args.max_annualized_vol,
+                            )
+                        )
+                        is not None
+                    }
                 for vol in vols:
                     for edge in edges:
                         for hold in holds:
@@ -2541,6 +2557,7 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
                                     dynamic_vol_window_seconds=args.vol_window_seconds if args.vol_mode == "realized" else None,
                                     min_annualized_vol=args.min_annualized_vol,
                                     max_annualized_vol=args.max_annualized_vol,
+                                    dynamic_vol_by_ts_ms=dynamic_vol_by_ts_ms,
                                 )
                                 row = {
                                     "market_slug": market_slug,
