@@ -10,6 +10,7 @@ import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import signal
 import time
 from typing import Any
 from uuid import uuid4
@@ -34,6 +35,12 @@ from hermes_polymarket.storage.db import Database
 from hermes_polymarket.storage.forward_positions import insert_forward_mark, insert_forward_run, insert_forward_signal, upsert_forward_position
 
 
+class MultiStrikePaperShutdown(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class MultiStrikePaperConfig:
     event_slug: str
@@ -53,6 +60,7 @@ class MultiStrikePaperConfig:
     timeout_seconds: int = 3600
     close_open_on_end: bool = False
     max_positions: int = 1
+    max_sleep_seconds: int = 5
 
 
 def _seconds_to_expiry(row: dict[str, Any], now: datetime) -> float:
@@ -212,7 +220,68 @@ def run_multi_strike_paper_watch(
     gamma = GammaClient()
     clob = ClobV2Client(settings)
     opened: list[ForwardPaperPosition] = []
+    active_payload: dict[str, Any] = {}
+    active_selected: dict[str, Any] | None = None
     marks = 0
+    stop_requested: str | None = None
+    previous_handlers: dict[int, Any] = {}
+
+    def _request_stop(signum: int, _frame: Any) -> None:
+        nonlocal stop_requested
+        stop_requested = signal.Signals(signum).name.lower()
+        raise MultiStrikePaperShutdown(stop_requested)
+
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(ValueError):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, _request_stop)
+
+    def _insert_run(summary: dict[str, Any], *, warnings: list[str] | None = None) -> None:
+        rows = db.conn.execute("SELECT * FROM forward_paper_positions WHERE run_id = ?", (run_id,)).fetchall()
+        closed_rows = [dict(row) for row in rows if row["status"] == "closed"]
+        open_rows = [dict(row) for row in rows if row["status"] == "open"]
+        insert_forward_run(
+            db,
+            run_id=run_id,
+            symbols=(config.symbol,),
+            config={**config.__dict__, "strategy": "multi_strike_target_hit_v1"},
+            summary={**summary, "positions_opened": len(rows), "positions_open": len(open_rows), "positions_closed": len(closed_rows)},
+            report={
+                "positions": len(rows),
+                "open": len(open_rows),
+                "closed": len(closed_rows),
+                "net_pnl": sum(float(row["net_pnl"] or 0.0) for row in closed_rows),
+            },
+            quality={
+                "warnings": warnings or ["multi_strike_model_not_calibrated"],
+                "data_quality": "paper_live_multi_strike",
+            },
+            artifacts={},
+            requested_seconds=config.seconds,
+            actual_seconds=max(0, int(time.time() - started)),
+            exploratory_threshold=True,
+        )
+
+    def _mark_open_position(position: ForwardPaperPosition, *, payload: dict[str, Any], reason_payload: dict[str, Any] | None = None) -> tuple[ForwardPaperPosition, float | None, OrderBook]:
+        book = clob.get_orderbook(position.token_id)
+        mark_price = book.best_bid
+        if mark_price is None:
+            return position, None, book
+        unrealized, mfe, mae = mark_position(position, mark_price=mark_price)
+        position = update_excursions(position, mfe=mfe, mae=mae)
+        insert_forward_mark(
+            db,
+            position_id=position.position_id,
+            ts_ms=int(time.time() * 1000),
+            mark_price=mark_price,
+            best_bid=book.best_bid,
+            best_ask=book.best_ask,
+            unrealized_pnl=unrealized,
+            payload={"strategy": "multi_strike_target_hit_v1", **(reason_payload or {})},
+        )
+        upsert_forward_position(db, position, payload=payload)
+        return position, mark_price, book
+
     try:
         events = gamma.list_events(slug=config.event_slug, active="true", closed="false", limit=5)
         if not events:
@@ -241,7 +310,7 @@ def run_multi_strike_paper_watch(
 
         entry_price = float(selected["best_ask"])
         shares = config.amount_usd / entry_price
-        signal = ForwardPaperSignal(
+        paper_signal = ForwardPaperSignal(
             signal_id=f"mss_{uuid4().hex[:12]}",
             run_id=run_id,
             symbol=config.symbol,
@@ -269,35 +338,51 @@ def run_multi_strike_paper_watch(
             "quality": selected.get("quality"),
             "config": config.__dict__,
         }
-        insert_forward_signal(db, _signal_row(signal, direction=str(selected["fair_value"]["direction"]), model_probability=float(selected["fair_value"]["probability_yes"]), payload=payload))
-        position = _position_from_signal(signal)
+        active_payload = payload
+        active_selected = selected
+        insert_forward_signal(db, _signal_row(paper_signal, direction=str(selected["fair_value"]["direction"]), model_probability=float(selected["fair_value"]["probability_yes"]), payload=payload))
+        position = _position_from_signal(paper_signal)
         if position is None:
             return {"mode": "multi_strike_paper_only", "run_id": run_id, "status": "signal_without_position"}
         upsert_forward_position(db, position, payload=payload)
         opened.append(position)
+        _insert_run(
+            {
+                "mode": "multi_strike_paper_only",
+                "run_id": run_id,
+                "status": "opened",
+                "event_slug": config.event_slug,
+                "symbol": config.symbol,
+                "data_quality": "paper_live_multi_strike",
+                "marks_written": marks,
+                "net_pnl": 0.0,
+            },
+            warnings=["multi_strike_model_not_calibrated", "run_in_progress"],
+        )
+        position, mark_price, _ = _mark_open_position(position, payload=payload, reason_payload={"reason": "entry_mark"})
+        if mark_price is not None:
+            marks += 1
+            opened = [position]
 
-        while time.time() - started < config.seconds and opened:
-            time.sleep(min(config.mark_interval_seconds, max(0.0, config.seconds - (time.time() - started))))
+        next_mark_at = time.time() + max(0, config.mark_interval_seconds)
+        while time.time() - started < config.seconds and opened and stop_requested is None:
+            sleep_for = min(
+                max(0.0, next_mark_at - time.time()),
+                max(1, config.max_sleep_seconds),
+                max(0.0, config.seconds - (time.time() - started)),
+            )
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            if time.time() < next_mark_at and time.time() - started < config.seconds and stop_requested is None:
+                continue
+            next_mark_at = time.time() + max(0, config.mark_interval_seconds)
             next_opened: list[ForwardPaperPosition] = []
             for position in opened:
-                book = clob.get_orderbook(position.token_id)
-                mark_price = book.best_bid
+                position, mark_price, book = _mark_open_position(position, payload=payload)
                 if mark_price is None:
                     next_opened.append(position)
                     continue
-                unrealized, mfe, mae = mark_position(position, mark_price=mark_price)
-                position = update_excursions(position, mfe=mfe, mae=mae)
                 marks += 1
-                insert_forward_mark(
-                    db,
-                    position_id=position.position_id,
-                    ts_ms=int(time.time() * 1000),
-                    mark_price=mark_price,
-                    best_bid=book.best_bid,
-                    best_ask=book.best_ask,
-                    unrealized_pnl=unrealized,
-                    payload={"strategy": "multi_strike_target_hit_v1"},
-                )
                 should_exit, reason = should_exit_position(
                     position,
                     mark_price=mark_price,
@@ -322,16 +407,16 @@ def run_multi_strike_paper_watch(
                     closed = close_position(position, ts_ms=int(time.time() * 1000), exit_price=mark_price, reason=reason)
                     upsert_forward_position(db, closed, payload={**payload, "exit_edge": latest_edge})
                 else:
-                    upsert_forward_position(db, position, payload=payload)
                     next_opened.append(position)
             opened = next_opened
 
-        if config.close_open_on_end:
+        if config.close_open_on_end or stop_requested is not None:
             for position in opened:
                 book = clob.get_orderbook(position.token_id)
                 if book.best_bid is not None:
-                    closed = close_position(position, ts_ms=int(time.time() * 1000), exit_price=book.best_bid, reason="run_end_mark")
-                    upsert_forward_position(db, closed, payload=payload)
+                    reason = f"interrupted_{stop_requested}" if stop_requested is not None else "run_end_mark"
+                    closed = close_position(position, ts_ms=int(time.time() * 1000), exit_price=book.best_bid, reason=reason)
+                    upsert_forward_position(db, closed, payload={**payload, "interrupted_by": stop_requested})
             opened = []
 
         rows = db.conn.execute("SELECT * FROM forward_paper_positions WHERE run_id = ?", (run_id,)).fetchall()
@@ -351,28 +436,61 @@ def run_multi_strike_paper_watch(
             "net_pnl": sum(float(row["net_pnl"] or 0.0) for row in closed_rows),
             "data_quality": "paper_live_multi_strike",
         }
-        insert_forward_run(
-            db,
-            run_id=run_id,
-            symbols=(config.symbol,),
-            config={**config.__dict__, "strategy": "multi_strike_target_hit_v1"},
-            summary=summary,
-            report={
-                "positions": len(rows),
-                "open": len(open_rows),
-                "closed": len(closed_rows),
-                "net_pnl": summary["net_pnl"],
-            },
-            quality={
-                "warnings": ["multi_strike_model_not_calibrated"],
+        if stop_requested is not None:
+            summary["status"] = "interrupted"
+            summary["interrupted_by"] = stop_requested
+        _insert_run(summary, warnings=["multi_strike_model_not_calibrated"] + ([f"interrupted_by_{stop_requested}"] if stop_requested else []))
+        return summary
+    except MultiStrikePaperShutdown as exc:
+        stop_requested = exc.reason
+        if opened:
+            for position in opened:
+                with contextlib.suppress(Exception):
+                    book = clob.get_orderbook(position.token_id)
+                    if book.best_bid is not None:
+                        closed = close_position(position, ts_ms=int(time.time() * 1000), exit_price=book.best_bid, reason=f"interrupted_{stop_requested}")
+                        upsert_forward_position(db, closed, payload={**active_payload, "interrupted_by": stop_requested})
+            opened = []
+        rows = db.conn.execute("SELECT * FROM forward_paper_positions WHERE run_id = ?", (run_id,)).fetchall()
+        closed_rows = [dict(row) for row in rows if row["status"] == "closed"]
+        open_rows = [dict(row) for row in rows if row["status"] == "open"]
+        summary = {
+            "mode": "multi_strike_paper_only",
+            "run_id": run_id,
+            "status": "interrupted",
+            "interrupted_by": stop_requested,
+            "event_slug": config.event_slug,
+            "symbol": config.symbol,
+            "selected": active_selected,
+            "positions_opened": len(rows),
+            "positions_open": len(open_rows),
+            "positions_closed": len(closed_rows),
+            "marks_written": marks,
+            "net_pnl": sum(float(row["net_pnl"] or 0.0) for row in closed_rows),
+            "data_quality": "paper_live_multi_strike",
+        }
+        _insert_run(summary, warnings=["multi_strike_model_not_calibrated", f"interrupted_by_{stop_requested}"])
+        return summary
+    except BaseException as exc:
+        _insert_run(
+            {
+                "mode": "multi_strike_paper_only",
+                "run_id": run_id,
+                "status": "error",
+                "event_slug": config.event_slug,
+                "symbol": config.symbol,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "marks_written": marks,
+                "net_pnl": 0.0,
                 "data_quality": "paper_live_multi_strike",
             },
-            artifacts={},
-            requested_seconds=config.seconds,
-            actual_seconds=max(0, int(time.time() - started)),
-            exploratory_threshold=True,
+            warnings=["multi_strike_model_not_calibrated", "run_error"],
         )
-        return summary
+        raise
     finally:
+        for signum, handler in previous_handlers.items():
+            with contextlib.suppress(ValueError):
+                signal.signal(signum, handler)
         gamma.close()
         clob.close()
