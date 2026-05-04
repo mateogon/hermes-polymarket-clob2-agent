@@ -2184,6 +2184,155 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
         finally:
             db.close()
 
+    if args.multi_strike_command == "promote":
+        from hermes_polymarket.crypto.market_quality import evaluate_market_quality
+        from hermes_polymarket.crypto.multi_strike_fair_value import fair_value_target_hit
+        from hermes_polymarket.crypto.multi_strike_market import parse_multi_strike_target
+        from hermes_polymarket.crypto.watchlist_seeding import current_reference_consensus
+
+        sweep_path = Path(args.sweep_json)
+        sweep = json.loads(sweep_path.read_text())
+        rows = sweep.get("rows") if isinstance(sweep, dict) else []
+        if not isinstance(rows, list):
+            print(json.dumps({"status": "invalid_sweep", "file": str(sweep_path)}, indent=2, sort_keys=True))
+            return 2
+        candidate_rows = [
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and bool(row.get("passes_promotion_gate"))
+            and float(row.get("cost_cents") or 0.0) >= args.min_cost_cents
+            and float(row.get("cost_cents") or 0.0) <= args.max_cost_cents
+            and int(row.get("simulated_trades") or 0) >= args.min_trades
+            and float(row.get("net_pnl") or 0.0) >= args.min_net_pnl
+        ]
+        seen_slugs: set[str] = set()
+        candidate_rows = [
+            row for row in candidate_rows if not (str(row.get("market_slug") or "") in seen_slugs or seen_slugs.add(str(row.get("market_slug") or "")))
+        ][: args.limit]
+        symbols = sorted({str(row.get("symbol") or args.symbol) for row in candidate_rows if row.get("symbol") or args.symbol})
+        references: dict[str, tuple[float, tuple[str, ...], float]] = {}
+        for symbol in symbols:
+            references[symbol] = current_reference_consensus(symbol)
+
+        gamma = GammaClient()
+        clob = ClobV2Client(_settings())
+        now = datetime.now(timezone.utc)
+        promoted: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        try:
+            for row in candidate_rows:
+                slug = str(row.get("market_slug") or "")
+                symbol = str(row.get("symbol") or args.symbol)
+                current_price, sources, max_dev = references[symbol]
+                markets = gamma.markets_by_slug(slug)
+                if not markets:
+                    rejected.append({"market_slug": slug, "reason": "market_not_found"})
+                    continue
+                market = markets[0]
+                event_slug = _market_event_slug(market) or slug
+                tokens = json.loads(market.get("clobTokenIds") or "[]") if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds") or []
+                yes_token = str(tokens[0]) if tokens else ""
+                target = parse_multi_strike_target(f"{market.get('question') or ''} {market.get('slug') or ''}", current_price=current_price)
+                target_price = row.get("target_price") or (target.target_price if target is not None else None)
+                if not yes_token or target_price is None:
+                    rejected.append({"market_slug": slug, "reason": "missing_token_or_target"})
+                    continue
+                seconds_to_expiry = 1.0
+                if market.get("endDate"):
+                    with contextlib.suppress(ValueError):
+                        parsed = datetime.fromisoformat(str(market["endDate"]).replace("Z", "+00:00"))
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        seconds_to_expiry = max(1.0, (parsed - now).total_seconds())
+                try:
+                    book = clob.get_orderbook(yes_token)
+                    quality = evaluate_market_quality(book).to_dict()
+                except Exception as exc:  # noqa: BLE001 - promotion report should explain candidate failure.
+                    rejected.append({"market_slug": slug, "reason": "book_error", "error": str(exc)})
+                    continue
+                fv = fair_value_target_hit(
+                    current_price=current_price,
+                    target_price=float(target_price),
+                    seconds_to_expiry=seconds_to_expiry,
+                    annualized_vol=args.annualized_vol,
+                )
+                best_ask = book.best_ask
+                current_edge = fv.probability_yes - best_ask if best_ask is not None else None
+                reasons: list[str] = []
+                if not quality.get("allowed"):
+                    reasons.append(f"quality:{quality.get('reason') or 'rejected'}")
+                if current_edge is None:
+                    reasons.append("no_best_ask")
+                elif current_edge < args.min_current_edge:
+                    reasons.append("current_edge_below_min")
+                if best_ask is not None and (best_ask < args.min_ask or best_ask > args.max_ask):
+                    reasons.append("ask_outside_bounds")
+                out = {
+                    "market_slug": slug,
+                    "symbol": symbol,
+                    "condition_id": market.get("conditionId") or market.get("condition_id"),
+                    "event_slug": event_slug,
+                    "yes_token_id": yes_token,
+                    "target_price": float(target_price),
+                    "historical": {
+                        "net_pnl": row.get("net_pnl"),
+                        "simulated_trades": row.get("simulated_trades"),
+                        "cost_cents": row.get("cost_cents"),
+                        "edge_threshold": row.get("edge_threshold"),
+                        "hold_seconds": row.get("hold_seconds"),
+                        "avg_evaluated_vol": row.get("avg_evaluated_vol"),
+                    },
+                    "current": {
+                        "current_price": current_price,
+                        "consensus_sources": list(sources),
+                        "max_deviation_pct": max_dev,
+                        "annualized_vol": args.annualized_vol,
+                        "probability_yes": fv.probability_yes,
+                        "best_bid": book.best_bid,
+                        "best_ask": best_ask,
+                        "edge": current_edge,
+                        "quality": quality,
+                    },
+                    "paper_command": (
+                        f".venv/bin/python -m hermes_polymarket.cli multi-strike paper-watch "
+                        f"--event-slug {event_slug} "
+                        f"--symbol {symbol} --amount {args.amount} --edge-threshold {args.min_current_edge} "
+                        f"--seconds {args.paper_seconds} --mark-interval-seconds 300 --close-open-on-end"
+                    ),
+                }
+                if reasons:
+                    rejected.append({**out, "reasons": reasons})
+                else:
+                    promoted.append(out)
+            payload = {
+                "mode": "multi_strike_promote_candidates",
+                "data_quality": "historical_spot_fair_value_plus_current_rest_book",
+                "sweep_json": str(sweep_path),
+                "gates": {
+                    "min_cost_cents": args.min_cost_cents,
+                    "max_cost_cents": args.max_cost_cents,
+                    "min_trades": args.min_trades,
+                    "min_net_pnl": args.min_net_pnl,
+                    "min_current_edge": args.min_current_edge,
+                    "min_ask": args.min_ask,
+                    "max_ask": args.max_ask,
+                },
+                "promoted": promoted,
+                "rejected": rejected,
+                "recommendation": "run_forward_paper_only_for_promoted_candidates",
+            }
+            if args.output:
+                path = Path(args.output)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                payload["output"] = str(path)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        finally:
+            gamma.close()
+            clob.close()
+
     if args.multi_strike_command == "calibrate":
         from hermes_polymarket.crypto.market_quality import evaluate_market_quality
         from hermes_polymarket.crypto.market_universe import filter_universe_candidates, scan_market_universe
@@ -2658,6 +2807,19 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
 
     print(f"unknown multi-strike command: {args.multi_strike_command}")
     return 2
+
+
+def _market_event_slug(market: dict[str, Any]) -> str | None:
+    for key in ("event_slug", "eventSlug", "eventsSlug"):
+        value = market.get(key)
+        if value:
+            return str(value)
+    events = market.get("events")
+    if isinstance(events, list) and events:
+        first = events[0]
+        if isinstance(first, dict) and first.get("slug"):
+            return str(first["slug"])
+    return None
 
 
 def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
@@ -3573,6 +3735,22 @@ def build_parser() -> argparse.ArgumentParser:
     multi_strike_report = multi_strike_sub.add_parser("report")
     multi_strike_report.add_argument("--run-id", required=True)
     multi_strike_report.set_defaults(func=cmd_multi_strike)
+    multi_strike_promote = multi_strike_sub.add_parser("promote")
+    multi_strike_promote.add_argument("--sweep-json", required=True)
+    multi_strike_promote.add_argument("--symbol", default=None, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    multi_strike_promote.add_argument("--annualized-vol", type=float, default=0.80)
+    multi_strike_promote.add_argument("--min-cost-cents", type=float, default=0.0)
+    multi_strike_promote.add_argument("--max-cost-cents", type=float, default=1.0)
+    multi_strike_promote.add_argument("--min-trades", type=int, default=5)
+    multi_strike_promote.add_argument("--min-net-pnl", type=float, default=0.0)
+    multi_strike_promote.add_argument("--min-current-edge", type=float, default=0.02)
+    multi_strike_promote.add_argument("--min-ask", type=float, default=0.03)
+    multi_strike_promote.add_argument("--max-ask", type=float, default=0.80)
+    multi_strike_promote.add_argument("--amount", type=float, default=5.0)
+    multi_strike_promote.add_argument("--paper-seconds", type=int, default=900)
+    multi_strike_promote.add_argument("--limit", type=int, default=10)
+    multi_strike_promote.add_argument("--output", default=None)
+    multi_strike_promote.set_defaults(func=cmd_multi_strike)
     multi_strike_calibrate = multi_strike_sub.add_parser("calibrate")
     multi_strike_calibrate.add_argument("--event-slug", required=True)
     multi_strike_calibrate.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
