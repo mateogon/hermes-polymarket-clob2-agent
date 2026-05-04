@@ -140,7 +140,7 @@ def select_multi_strike_candidate(
         spread = candidate.get("spread")
         if spread is None:
             reasons.append("no_spread")
-        elif spread > config.max_spread:
+        elif spread > config.max_spread + 1e-9:
             reasons.append("spread_above_max")
         if edge is not None and spread is not None and edge < spread + config.edge_spread_buffer:
             reasons.append("edge_below_spread_buffer")

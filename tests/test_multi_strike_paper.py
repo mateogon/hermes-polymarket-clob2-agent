@@ -126,3 +126,30 @@ def test_multi_strike_candidate_rejects_wide_spread():
 
     assert selected is None
     assert "spread_above_max" in considered[0]["reject_reason"]
+
+
+def test_multi_strike_candidate_allows_one_cent_spread_with_float_noise():
+    class FakeClob:
+        def get_orderbook(self, token_id):
+            return OrderBook(
+                token_id=token_id,
+                bids=(OrderBookLevel(0.09, 1_000.0),),
+                asks=(OrderBookLevel(0.10, 1_000.0),),
+            )
+
+    selected, considered = select_multi_strike_candidate(
+        event=_event(),
+        clob=FakeClob(),
+        symbol="btcusdt",
+        current_price=78_700.0,
+        config=MultiStrikePaperConfig(
+            event_slug="when-will-bitcoin-hit-150k",
+            symbol="btcusdt",
+            edge_threshold=0.0,
+            max_spread=0.01,
+        ),
+    )
+
+    assert selected is not None
+    assert considered[0]["spread"] == 0.010000000000000009
+    assert considered[0]["reject_reason"] == "ok"
