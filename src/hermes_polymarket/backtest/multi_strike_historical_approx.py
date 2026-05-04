@@ -38,6 +38,7 @@ class MultiStrikeSpotReplayTrade:
     model_probability: float
     seconds_to_expiry: float
     fair_value_reason: str
+    cost_cents: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__
@@ -109,6 +110,7 @@ def replay_yes_trade_path_with_spot(
     edge_threshold: float,
     amount_usd: float,
     hold_seconds: int,
+    cost_cents: float = 0.0,
 ) -> tuple[list[MultiStrikeSpotReplayTrade], dict[str, Any]]:
     yes_trades = sorted(
         [trade for trade in trades if trade.asset_id == token_id and trade.outcome.lower() == "yes"],
@@ -133,8 +135,9 @@ def replay_yes_trade_path_with_spot(
             seconds_to_expiry=seconds_to_expiry,
             annualized_vol=annualized_vol,
         )
-        edge = fv.probability_yes - entry.price
-        if edge < edge_threshold or entry.price <= 0:
+        effective_entry_price = entry.price + cost_cents / 100.0
+        edge = fv.probability_yes - effective_entry_price
+        if edge < edge_threshold or effective_entry_price <= 0:
             skipped_below_edge += 1
             idx += 1
             continue
@@ -145,14 +148,15 @@ def replay_yes_trade_path_with_spot(
         if exit_trade is None or exit_trade.timestamp <= entry.timestamp:
             idx += 1
             continue
-        shares = amount_usd / entry.price
-        pnl = shares * (exit_trade.price - entry.price)
+        effective_exit_price = max(0.0, exit_trade.price - cost_cents / 100.0)
+        shares = amount_usd / effective_entry_price
+        pnl = shares * (effective_exit_price - effective_entry_price)
         results.append(
             MultiStrikeSpotReplayTrade(
                 entry_ts=entry.timestamp,
                 exit_ts=exit_trade.timestamp,
-                entry_price=entry.price,
-                exit_price=exit_trade.price,
+                entry_price=effective_entry_price,
+                exit_price=effective_exit_price,
                 entry_spot=spot,
                 shares=shares,
                 pnl=pnl,
@@ -161,6 +165,7 @@ def replay_yes_trade_path_with_spot(
                 model_probability=fv.probability_yes,
                 seconds_to_expiry=seconds_to_expiry,
                 fair_value_reason=fv.reason,
+                cost_cents=cost_cents,
             )
         )
         idx = yes_trades.index(exit_trade) + 1
@@ -171,6 +176,7 @@ def replay_yes_trade_path_with_spot(
         spot_points=len(spots),
         skipped_no_spot=skipped_no_spot,
         skipped_below_edge=skipped_below_edge,
+        cost_cents=cost_cents,
     )
     return results, summary
 
@@ -191,6 +197,7 @@ def summarize_spot_replay(
     spot_points: int,
     skipped_no_spot: int,
     skipped_below_edge: int,
+    cost_cents: float = 0.0,
 ) -> dict[str, Any]:
     pnl = [row.pnl for row in results]
     wins = [value for value in pnl if value > 0]
@@ -211,6 +218,7 @@ def summarize_spot_replay(
         "simulated_trades": len(results),
         "skipped_no_spot": skipped_no_spot,
         "skipped_below_edge": skipped_below_edge,
+        "cost_cents": cost_cents,
         "net_pnl": sum(pnl),
         "win_rate": len(wins) / len(results) if results else 0.0,
         "avg_roi": sum(row.roi for row in results) / len(results) if results else 0.0,

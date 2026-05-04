@@ -2453,6 +2453,174 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
             data_api.close()
             binance.close()
 
+    if args.multi_strike_command == "sweep":
+        from hermes_polymarket.backtest.multi_strike_historical_approx import replay_yes_trade_path_with_spot
+        from hermes_polymarket.crypto.multi_strike_market import parse_multi_strike_target
+        from hermes_polymarket.data_sources.binance_historical import BinanceHistoricalClient
+        from hermes_polymarket.data_sources.polymarket_data_api import PolymarketDataApi
+
+        market_slugs = [value.strip() for value in args.market_slugs.split(",") if value.strip()]
+        vols = [float(value) for value in args.vol_grid.split(",") if value.strip()]
+        edges = [float(value) for value in args.edge_grid.split(",") if value.strip()]
+        holds = [int(value) for value in args.hold_grid.split(",") if value.strip()]
+        costs = [float(value) for value in args.cost_cents_grid.split(",") if value.strip()]
+        gamma = GammaClient()
+        data_api = PolymarketDataApi()
+        binance = BinanceHistoricalClient()
+        rows: list[dict[str, Any]] = []
+        market_reports: list[dict[str, Any]] = []
+        try:
+            for market_slug in market_slugs:
+                markets = gamma.markets_by_slug(market_slug)
+                if not markets:
+                    market_reports.append({"market_slug": market_slug, "status": "market_not_found"})
+                    continue
+                market = markets[0]
+                condition_id = str(market.get("conditionId") or market.get("condition_id") or "")
+                tokens = json.loads(market.get("clobTokenIds") or "[]") if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds") or []
+                yes_token = str(tokens[0]) if tokens else ""
+                end_date = market.get("endDate")
+                if not condition_id or not yes_token or not end_date:
+                    market_reports.append({"market_slug": market_slug, "status": "missing_market_fields"})
+                    continue
+                parsed_end = datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+                if parsed_end.tzinfo is None:
+                    parsed_end = parsed_end.replace(tzinfo=timezone.utc)
+                expiry_ts_ms = int(parsed_end.timestamp() * 1000)
+                trades = data_api.get_trades(market=condition_id, limit=args.limit)
+                if not trades:
+                    market_reports.append({"market_slug": market_slug, "status": "no_trades", "condition_id": condition_id})
+                    continue
+                min_trade_ts_ms = min(trade.timestamp for trade in trades) * 1000
+                max_trade_ts_ms = max(trade.timestamp for trade in trades) * 1000
+                max_hold_ms = (max(holds) if holds else 0) * 1000
+                candles = binance.get_klines_paginated(
+                    symbol=args.symbol,
+                    interval=args.interval,
+                    start_ts_ms=max(0, min_trade_ts_ms - 60_000),
+                    end_ts_ms=max_trade_ts_ms + max(max_hold_ms, 60_000),
+                )
+                if not candles:
+                    market_reports.append({"market_slug": market_slug, "status": "no_spot_candles", "condition_id": condition_id})
+                    continue
+                target = parse_multi_strike_target(f"{market.get('question') or ''} {market.get('slug') or ''}", current_price=candles[0].close)
+                if target is None:
+                    market_reports.append({"market_slug": market_slug, "status": "target_parse_failed", "condition_id": condition_id})
+                    continue
+                market_reports.append(
+                    {
+                        "market_slug": market_slug,
+                        "status": "ok",
+                        "condition_id": condition_id,
+                        "target_price": target.target_price,
+                        "observed_trades": len(trades),
+                        "spot_points": len(candles),
+                    }
+                )
+                spot_prices = [(candle.open_ts_ms, candle.close) for candle in candles]
+                for vol in vols:
+                    for edge in edges:
+                        for hold in holds:
+                            for cost in costs:
+                                results, summary = replay_yes_trade_path_with_spot(
+                                    trades,
+                                    token_id=yes_token,
+                                    spot_prices=spot_prices,
+                                    target_price=target.target_price,
+                                    expiry_ts_ms=expiry_ts_ms,
+                                    annualized_vol=vol,
+                                    edge_threshold=edge,
+                                    amount_usd=args.amount,
+                                    hold_seconds=hold,
+                                    cost_cents=cost,
+                                )
+                                row = {
+                                    "market_slug": market_slug,
+                                    "condition_id": condition_id,
+                                    "symbol": args.symbol,
+                                    "target_price": target.target_price,
+                                    "annualized_vol": vol,
+                                    "edge_threshold": edge,
+                                    "hold_seconds": hold,
+                                    "cost_cents": cost,
+                                    "amount_usd": args.amount,
+                                    **summary,
+                                }
+                                row["robust_score"] = float(row["net_pnl"] or 0.0) - float(row["max_drawdown"] or 0.0)
+                                row["passes_promotion_gate"] = bool(
+                                    int(row["simulated_trades"]) >= args.min_trades
+                                    and float(row["net_pnl"] or 0.0) > 0
+                                    and float(row["max_drawdown"] or 0.0) <= args.max_drawdown
+                                )
+                                row["sample_trades"] = [trade.to_dict() for trade in results[: args.sample_trades]]
+                                rows.append(row)
+            ranked = sorted(
+                rows,
+                key=lambda row: (
+                    bool(row.get("passes_promotion_gate")),
+                    float(row.get("robust_score") or 0.0),
+                    float(row.get("net_pnl") or 0.0),
+                    int(row.get("simulated_trades") or 0),
+                ),
+                reverse=True,
+            )
+            payload = {
+                "mode": "multi_strike_sweep",
+                "data_quality": "historical_spot_fair_value_with_cost_penalty",
+                "symbol": args.symbol,
+                "market_slugs": market_slugs,
+                "grids": {
+                    "annualized_vol": vols,
+                    "edge_threshold": edges,
+                    "hold_seconds": holds,
+                    "cost_cents": costs,
+                },
+                "promotion_gate": {"min_trades": args.min_trades, "max_drawdown": args.max_drawdown},
+                "markets": market_reports,
+                "rows": ranked,
+                "top": ranked[: args.top],
+                "warning": "Uses historical Binance candles and Polymarket trade prints with synthetic cost penalties; still not executable L2 truth.",
+            }
+            if args.output:
+                path = Path(args.output)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                payload["output"] = str(path)
+            if args.csv_output:
+                csv_path = Path(args.csv_output)
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+                fieldnames = [
+                    "market_slug",
+                    "symbol",
+                    "target_price",
+                    "annualized_vol",
+                    "edge_threshold",
+                    "hold_seconds",
+                    "cost_cents",
+                    "simulated_trades",
+                    "net_pnl",
+                    "avg_roi",
+                    "win_rate",
+                    "profit_factor",
+                    "max_drawdown",
+                    "robust_score",
+                    "passes_promotion_gate",
+                    "skipped_below_edge",
+                    "skipped_no_spot",
+                ]
+                with csv_path.open("w", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for row in ranked:
+                        writer.writerow({field: row.get(field) for field in fieldnames})
+                payload["csv_output"] = str(csv_path)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        finally:
+            gamma.close()
+            data_api.close()
+            binance.close()
+
     print(f"unknown multi-strike command: {args.multi_strike_command}")
     return 2
 
@@ -3398,6 +3566,23 @@ def build_parser() -> argparse.ArgumentParser:
     multi_strike_spot.add_argument("--limit", type=int, default=500)
     multi_strike_spot.add_argument("--output", default=None)
     multi_strike_spot.set_defaults(func=cmd_multi_strike)
+    multi_strike_sweep = multi_strike_sub.add_parser("sweep")
+    multi_strike_sweep.add_argument("--market-slugs", required=True)
+    multi_strike_sweep.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    multi_strike_sweep.add_argument("--amount", type=float, default=5.0)
+    multi_strike_sweep.add_argument("--vol-grid", default="0.4,0.6,0.8,1.0")
+    multi_strike_sweep.add_argument("--edge-grid", default="0.03,0.05,0.08,0.12")
+    multi_strike_sweep.add_argument("--hold-grid", default="900,3600,14400")
+    multi_strike_sweep.add_argument("--cost-cents-grid", default="0,1,2,3")
+    multi_strike_sweep.add_argument("--interval", default="1m")
+    multi_strike_sweep.add_argument("--limit", type=int, default=500)
+    multi_strike_sweep.add_argument("--min-trades", type=int, default=20)
+    multi_strike_sweep.add_argument("--max-drawdown", type=float, default=10.0)
+    multi_strike_sweep.add_argument("--sample-trades", type=int, default=3)
+    multi_strike_sweep.add_argument("--top", type=int, default=20)
+    multi_strike_sweep.add_argument("--output", default=None)
+    multi_strike_sweep.add_argument("--csv-output", default=None)
+    multi_strike_sweep.set_defaults(func=cmd_multi_strike)
 
     wallet_flow = sub.add_parser("wallet-flow")
     wallet_sub = wallet_flow.add_subparsers(dest="wallet_command", required=True)
