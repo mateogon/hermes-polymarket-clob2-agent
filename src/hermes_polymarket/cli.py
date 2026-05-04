@@ -2369,6 +2369,113 @@ def cmd_crypto_latency_opportunities(args: argparse.Namespace) -> int:
 
 
 def cmd_multi_strike(args: argparse.Namespace) -> int:
+    if args.multi_strike_command == "live-sweep":
+        from hermes_polymarket.crypto.multi_strike_live_sweep import (
+            MultiStrikeLiveSweepConfig,
+            run_multi_strike_live_sweep,
+            write_live_sweep_outputs,
+        )
+
+        symbols = tuple(value.strip().lower() for value in args.symbols.split(",") if value.strip())
+        payload = run_multi_strike_live_sweep(
+            settings=_settings(),
+            config=MultiStrikeLiveSweepConfig(
+                symbols=symbols,
+                limit_events=args.limit_events,
+                limit_markets=args.limit_markets,
+                candidate_limit=args.candidate_limit,
+                min_market_score=args.min_market_score,
+                annualized_vol=args.annualized_vol,
+                edge_threshold=args.edge_threshold,
+                min_ask=args.min_ask,
+                max_ask=args.max_ask,
+                max_spread=args.max_spread,
+                edge_spread_buffer=args.edge_spread_buffer,
+                top=args.top,
+            ),
+        )
+        paths = write_live_sweep_outputs(
+            payload,
+            output=Path(args.output) if args.output else None,
+            csv_output=Path(args.csv_output) if args.csv_output else None,
+        )
+        payload.update(paths)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    if args.multi_strike_command == "paper-watch-best":
+        from hermes_polymarket.crypto.multi_strike_live_sweep import load_live_sweep
+        from hermes_polymarket.crypto.multi_strike_paper import MultiStrikePaperConfig, run_multi_strike_paper_watch
+
+        sweep = load_live_sweep(Path(args.sweep_json))
+        rows = sweep.get("rows") if isinstance(sweep, dict) else []
+        recommended = [
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and row.get("recommended")
+            and (args.symbol is None or str(row.get("symbol") or "").lower() == args.symbol.lower())
+        ]
+        if not recommended:
+            payload = {
+                "mode": "multi_strike_paper_watch_best",
+                "status": "no_recommended_candidate",
+                "sweep_json": args.sweep_json,
+                "recommendation": "do_not_run_paper_watch",
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        selected = recommended[0]
+        previous_event_log = os.environ.get("HERMES_RUN_EVENT_LOG_PATH")
+        if args.event_log_output:
+            os.environ["HERMES_RUN_EVENT_LOG_PATH"] = args.event_log_output
+        settings = _settings()
+        db = Database(settings.database_path)
+        db.init_schema(settings.initial_bankroll)
+        try:
+            config = MultiStrikePaperConfig(
+                event_slug=str(selected["event_slug"]),
+                symbol=str(selected["symbol"]),
+                amount_usd=args.amount,
+                edge_threshold=args.edge_threshold,
+                exit_edge_threshold=args.exit_edge_threshold,
+                seconds=args.seconds,
+                mark_interval_seconds=args.mark_interval_seconds,
+                annualized_vol=args.annualized_vol,
+                min_ask=args.min_ask,
+                max_ask=args.max_ask,
+                max_spread=args.max_spread,
+                edge_spread_buffer=args.edge_spread_buffer,
+                take_profit_cents=args.take_profit_cents,
+                stop_loss_cents=args.stop_loss_cents,
+                timeout_seconds=args.timeout_seconds,
+                close_open_on_end=args.close_open_on_end,
+                max_positions=1,
+            )
+            result = run_multi_strike_paper_watch(db=db, settings=settings, config=config)
+            payload = {
+                "mode": "multi_strike_paper_watch_best",
+                "sweep_json": args.sweep_json,
+                "selected_from_sweep": {
+                    "event_slug": selected.get("event_slug"),
+                    "slug": selected.get("slug"),
+                    "symbol": selected.get("symbol"),
+                    "edge": selected.get("edge"),
+                    "best_ask": selected.get("best_ask"),
+                    "quality": selected.get("quality"),
+                },
+                "result": result,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0 if result.get("status") in {"completed", "no_candidate_opened"} else 2
+        finally:
+            db.close()
+            if args.event_log_output:
+                if previous_event_log is None:
+                    os.environ.pop("HERMES_RUN_EVENT_LOG_PATH", None)
+                else:
+                    os.environ["HERMES_RUN_EVENT_LOG_PATH"] = previous_event_log
+
     if args.multi_strike_command == "paper-watch":
         from hermes_polymarket.crypto.multi_strike_paper import MultiStrikePaperConfig, run_multi_strike_paper_watch
 
@@ -4331,6 +4438,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     multi_strike = sub.add_parser("multi-strike")
     multi_strike_sub = multi_strike.add_subparsers(dest="multi_strike_command", required=True)
+    multi_strike_live_sweep = multi_strike_sub.add_parser("live-sweep")
+    multi_strike_live_sweep.add_argument("--symbols", default="btcusdt,ethusdt,solusdt,xrpusdt")
+    multi_strike_live_sweep.add_argument("--limit-events", type=int, default=2000)
+    multi_strike_live_sweep.add_argument("--limit-markets", type=int, default=2000)
+    multi_strike_live_sweep.add_argument("--candidate-limit", type=int, default=300)
+    multi_strike_live_sweep.add_argument("--min-market-score", type=float, default=0.75)
+    multi_strike_live_sweep.add_argument("--annualized-vol", type=float, default=0.80)
+    multi_strike_live_sweep.add_argument("--edge-threshold", type=float, default=0.0)
+    multi_strike_live_sweep.add_argument("--min-ask", type=float, default=0.03)
+    multi_strike_live_sweep.add_argument("--max-ask", type=float, default=0.60)
+    multi_strike_live_sweep.add_argument("--max-spread", type=float, default=0.01)
+    multi_strike_live_sweep.add_argument("--edge-spread-buffer", type=float, default=0.02)
+    multi_strike_live_sweep.add_argument("--top", type=int, default=50)
+    multi_strike_live_sweep.add_argument("--output", default=None)
+    multi_strike_live_sweep.add_argument("--csv-output", default=None)
+    multi_strike_live_sweep.set_defaults(func=cmd_multi_strike)
+    multi_strike_watch_best = multi_strike_sub.add_parser("paper-watch-best")
+    multi_strike_watch_best.add_argument("--sweep-json", required=True)
+    multi_strike_watch_best.add_argument("--symbol", default=None, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    multi_strike_watch_best.add_argument("--amount", type=float, default=5.0)
+    multi_strike_watch_best.add_argument("--edge-threshold", type=float, default=0.0)
+    multi_strike_watch_best.add_argument("--exit-edge-threshold", type=float, default=0.02)
+    multi_strike_watch_best.add_argument("--seconds", type=int, default=300)
+    multi_strike_watch_best.add_argument("--mark-interval-seconds", type=int, default=30)
+    multi_strike_watch_best.add_argument("--annualized-vol", type=float, default=0.80)
+    multi_strike_watch_best.add_argument("--min-ask", type=float, default=0.03)
+    multi_strike_watch_best.add_argument("--max-ask", type=float, default=0.60)
+    multi_strike_watch_best.add_argument("--max-spread", type=float, default=0.01)
+    multi_strike_watch_best.add_argument("--edge-spread-buffer", type=float, default=0.02)
+    multi_strike_watch_best.add_argument("--take-profit-cents", type=float, default=5.0)
+    multi_strike_watch_best.add_argument("--stop-loss-cents", type=float, default=5.0)
+    multi_strike_watch_best.add_argument("--timeout-seconds", type=int, default=300)
+    multi_strike_watch_best.add_argument("--close-open-on-end", action="store_true")
+    multi_strike_watch_best.add_argument("--event-log-output", default=None)
+    multi_strike_watch_best.set_defaults(func=cmd_multi_strike)
     multi_strike_watch = multi_strike_sub.add_parser("paper-watch")
     multi_strike_watch.add_argument("--event-slug", required=True)
     multi_strike_watch.add_argument("--symbol", required=True, choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])

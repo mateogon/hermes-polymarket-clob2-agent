@@ -19,6 +19,19 @@ def test_parse_reach_pt_decimal_target():
     assert info.target_direction == "above"
 
 
+def test_parse_dip_to_target_before_event_year():
+    info = parse_multi_strike_target(
+        "Will Ethereum dip to $800 by December 31, 2026? "
+        "will-ethereum-dip-to-800-by-december-31-2026 "
+        "What price will Ethereum hit in 2026?",
+        current_price=2350,
+    )
+
+    assert info is not None
+    assert info.target_price == 800
+    assert info.target_direction == "below"
+
+
 def test_barrier_probability_decreases_for_farther_target():
     near = fair_value_target_hit(current_price=100.0, target_price=110.0, seconds_to_expiry=31_536_000)
     far = fair_value_target_hit(current_price=100.0, target_price=200.0, seconds_to_expiry=31_536_000)

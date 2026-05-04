@@ -28,10 +28,15 @@ def _parse_price(raw: str, suffix: str | None) -> float:
 
 def parse_multi_strike_target(text: str, *, current_price: float | None = None) -> MultiStrikeTargetInfo | None:
     normalized = _normalize_price_text(text)
-    if not re.search(r"\b(hit|reach|touch)\b", normalized):
+    if not re.search(r"\b(hit|reach|touch|dip|drop|fall)\b", normalized):
         return None
 
-    match = re.search(r"\b(?:hit|reach|touch)\b[^0-9]*(\d+(?:\.\d+)?)(k|m)?\b", normalized)
+    # Prefer explicit downside phrasing before generic event titles like
+    # "What price will Ethereum hit in 2026?", otherwise the year can be
+    # misparsed as the target for "dip to 800" markets.
+    match = re.search(r"\b(?:dip|drop|fall)\s+to\b[^0-9]*(\d+(?:\.\d+)?)(k|m)?\b", normalized)
+    if not match:
+        match = re.search(r"\b(?:hit|reach|touch)\b[^0-9]*(\d+(?:\.\d+)?)(k|m)?\b", normalized)
     if not match:
         return None
 
