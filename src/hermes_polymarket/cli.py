@@ -2387,6 +2387,8 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
                 annualized_vol=args.annualized_vol,
                 min_ask=args.min_ask,
                 max_ask=args.max_ask,
+                max_spread=args.max_spread,
+                edge_spread_buffer=args.edge_spread_buffer,
                 take_profit_cents=args.take_profit_cents,
                 stop_loss_cents=args.stop_loss_cents,
                 timeout_seconds=args.timeout_seconds,
@@ -4340,6 +4342,8 @@ def build_parser() -> argparse.ArgumentParser:
     multi_strike_watch.add_argument("--annualized-vol", type=float, default=0.80)
     multi_strike_watch.add_argument("--min-ask", type=float, default=0.03)
     multi_strike_watch.add_argument("--max-ask", type=float, default=0.60)
+    multi_strike_watch.add_argument("--max-spread", type=float, default=0.01)
+    multi_strike_watch.add_argument("--edge-spread-buffer", type=float, default=0.0)
     multi_strike_watch.add_argument("--take-profit-cents", type=float, default=5.0)
     multi_strike_watch.add_argument("--stop-loss-cents", type=float, default=5.0)
     multi_strike_watch.add_argument("--timeout-seconds", type=int, default=3600)

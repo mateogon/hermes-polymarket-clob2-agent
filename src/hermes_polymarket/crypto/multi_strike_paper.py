@@ -46,6 +46,8 @@ class MultiStrikePaperConfig:
     annualized_vol: float = 0.80
     min_ask: float = 0.03
     max_ask: float = 0.60
+    max_spread: float = 0.01
+    edge_spread_buffer: float = 0.0
     take_profit_cents: float = 5.0
     stop_loss_cents: float = 5.0
     timeout_seconds: int = 3600
@@ -135,6 +137,13 @@ def select_multi_strike_candidate(
         edge = candidate.get("edge")
         if edge is None or edge < config.edge_threshold:
             reasons.append("edge_below_threshold")
+        spread = candidate.get("spread")
+        if spread is None:
+            reasons.append("no_spread")
+        elif spread > config.max_spread:
+            reasons.append("spread_above_max")
+        if edge is not None and spread is not None and edge < spread + config.edge_spread_buffer:
+            reasons.append("edge_below_spread_buffer")
         considered.append({**candidate, "selected": not reasons, "reject_reason": ",".join(reasons) if reasons else "ok"})
 
     selected = [row for row in considered if row.get("selected")]

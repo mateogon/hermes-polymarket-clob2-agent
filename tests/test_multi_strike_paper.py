@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from hermes_polymarket.crypto.multi_strike_paper import MultiStrikePaperConfig, run_multi_strike_paper_watch
+from hermes_polymarket.crypto.multi_strike_paper import MultiStrikePaperConfig, run_multi_strike_paper_watch, select_multi_strike_candidate
 from hermes_polymarket.polymarket.types import OrderBook, OrderBookLevel
 from hermes_polymarket.storage.db import Database
 
@@ -59,10 +59,11 @@ def test_multi_strike_paper_watch_opens_and_marks(monkeypatch, tmp_path):
         config=MultiStrikePaperConfig(
             event_slug="when-will-bitcoin-hit-150k",
             symbol="btcusdt",
-            seconds=0,
-            mark_interval_seconds=0,
-            close_open_on_end=True,
-        ),
+                seconds=0,
+                mark_interval_seconds=0,
+                close_open_on_end=True,
+                max_spread=0.03,
+            ),
         run_id="run",
     )
 
@@ -72,3 +73,56 @@ def test_multi_strike_paper_watch_opens_and_marks(monkeypatch, tmp_path):
     assert db.conn.execute("SELECT COUNT(*) AS n FROM forward_paper_signals").fetchone()["n"] == 1
     assert db.conn.execute("SELECT COUNT(*) AS n FROM forward_paper_positions").fetchone()["n"] == 1
     assert db.conn.execute("SELECT COUNT(*) AS n FROM forward_paper_runs").fetchone()["n"] == 1
+
+
+def test_multi_strike_candidate_requires_spread_aware_edge():
+    class FakeClob:
+        def get_orderbook(self, token_id):
+            return OrderBook(
+                token_id=token_id,
+                bids=(OrderBookLevel(0.09, 1_000.0),),
+                asks=(OrderBookLevel(0.10, 1_000.0),),
+            )
+
+    selected, considered = select_multi_strike_candidate(
+        event=_event(),
+        clob=FakeClob(),
+        symbol="btcusdt",
+        current_price=78_700.0,
+        config=MultiStrikePaperConfig(
+            event_slug="when-will-bitcoin-hit-150k",
+            symbol="btcusdt",
+            edge_threshold=0.0,
+            max_spread=0.01,
+            edge_spread_buffer=0.50,
+        ),
+    )
+
+    assert selected is None
+    assert "edge_below_spread_buffer" in considered[0]["reject_reason"]
+
+
+def test_multi_strike_candidate_rejects_wide_spread():
+    class FakeClob:
+        def get_orderbook(self, token_id):
+            return OrderBook(
+                token_id=token_id,
+                bids=(OrderBookLevel(0.08, 1_000.0),),
+                asks=(OrderBookLevel(0.11, 1_000.0),),
+            )
+
+    selected, considered = select_multi_strike_candidate(
+        event=_event(),
+        clob=FakeClob(),
+        symbol="btcusdt",
+        current_price=78_700.0,
+        config=MultiStrikePaperConfig(
+            event_slug="when-will-bitcoin-hit-150k",
+            symbol="btcusdt",
+            edge_threshold=0.0,
+            max_spread=0.01,
+        ),
+    )
+
+    assert selected is None
+    assert "spread_above_max" in considered[0]["reject_reason"]
