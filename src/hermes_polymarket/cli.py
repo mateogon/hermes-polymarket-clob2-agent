@@ -2413,8 +2413,9 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
         for symbol in symbols:
             references[symbol] = current_reference_consensus(symbol)
 
+        settings = _settings()
         gamma = GammaClient()
-        clob = ClobV2Client(_settings())
+        clob = ClobV2Client(settings)
         now = datetime.now(timezone.utc)
         promoted: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
@@ -2520,6 +2521,9 @@ def cmd_multi_strike(args: argparse.Namespace) -> int:
                 "rejected": rejected,
                 "recommendation": "run_forward_paper_only_for_promoted_candidates",
             }
+            if args.hypothesis_id:
+                _record_promotion_report(settings, args.hypothesis_id, payload)
+                payload["hypothesis_id"] = args.hypothesis_id
             if args.output:
                 path = Path(args.output)
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -3219,6 +3223,51 @@ def _market_event_slug(market: dict[str, Any]) -> str | None:
         if isinstance(first, dict) and first.get("slug"):
             return str(first["slug"])
     return None
+
+
+def _record_promotion_report(settings: Any, hypothesis_id: str, payload: dict[str, Any]) -> None:
+    from hermes_polymarket.learning.research_ledger import update_hypothesis
+
+    db = Database(settings.database_path)
+    db.init_schema(settings.initial_bankroll)
+    try:
+        promoted = payload.get("promoted") if isinstance(payload.get("promoted"), list) else []
+        rejected = payload.get("rejected") if isinstance(payload.get("rejected"), list) else []
+        status = "promoted_to_forward_paper" if promoted else "rejected_promotion_gate"
+        update_hypothesis(
+            db,
+            hypothesis_id=hypothesis_id,
+            status=status,
+            evidence={
+                "promotion_data_quality": payload.get("data_quality"),
+                "promotion_gates": payload.get("gates"),
+                "promoted_count": len(promoted),
+                "rejected_count": len(rejected),
+                "top_rejection_reasons": _top_promotion_rejection_reasons(rejected),
+            },
+            next_action="run promoted paper command" if promoted else "do not run forward paper until promotion gate passes",
+            result={
+                "promotion_status": status,
+                "promoted": promoted[:5],
+                "rejected": rejected[:10],
+            },
+        )
+    finally:
+        db.close()
+
+
+def _top_promotion_rejection_reasons(rejected: list[Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rejected:
+        if not isinstance(row, dict):
+            continue
+        reasons = row.get("reasons")
+        if not isinstance(reasons, list):
+            reasons = [row.get("reason") or "unknown"]
+        for reason in reasons:
+            key = str(reason or "unknown")
+            counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def cmd_crypto_paper_watch(args: argparse.Namespace) -> int:
@@ -4221,6 +4270,7 @@ def build_parser() -> argparse.ArgumentParser:
     multi_strike_promote.add_argument("--paper-seconds", type=int, default=900)
     multi_strike_promote.add_argument("--limit", type=int, default=10)
     multi_strike_promote.add_argument("--output", default=None)
+    multi_strike_promote.add_argument("--hypothesis-id", default=None)
     multi_strike_promote.set_defaults(func=cmd_multi_strike)
     multi_strike_calibrate = multi_strike_sub.add_parser("calibrate")
     multi_strike_calibrate.add_argument("--event-slug", required=True)
