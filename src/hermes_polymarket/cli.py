@@ -200,10 +200,95 @@ def cmd_research(args: argparse.Namespace) -> int:
             report = experiment_report(db, limit=args.limit)
             print(json.dumps({"environment": settings.environment, **report}, indent=2, sort_keys=True))
             return 0
+        if args.research_command == "data":
+            payload = _research_data_command(args)
+            print(json.dumps({"environment": settings.environment, **payload}, indent=2, sort_keys=True))
+            return 0
     finally:
         db.close()
     print("unknown research command")
     return 2
+
+
+def _research_data_command(args: argparse.Namespace) -> dict[str, Any]:
+    from hermes_polymarket.data_sources.binance_historical import BinanceHistoricalClient
+    from hermes_polymarket.data_sources.polymarket_data_api import PolymarketDataApi
+    from hermes_polymarket.polymarket.gamma_client import GammaClient
+    from hermes_polymarket.research.data_cache import ResearchDataCache
+
+    cache = ResearchDataCache()
+    if args.data_command == "status":
+        return {"mode": "research_data_cache_status", **cache.status()}
+    if args.data_command == "fetch":
+        if args.kind == "gamma-market":
+            gamma = GammaClient()
+            try:
+                markets = gamma.markets_by_slug(args.slug)
+            finally:
+                gamma.close()
+            manifest = cache.write_gamma_market(slug=args.slug, markets=markets, params={"slug": args.slug})
+            return {"mode": "research_data_fetch", "kind": args.kind, "manifest": manifest}
+        if args.kind == "gamma-universe":
+            gamma = GammaClient()
+            events: list[dict[str, Any]] = []
+            markets: list[dict[str, Any]] = []
+            try:
+                for offset in range(0, args.limit_events, args.page_size):
+                    page = gamma.list_events(active="true", closed="false", order=args.order, ascending="false", limit=min(args.page_size, args.limit_events - offset), offset=offset)
+                    events.extend(page)
+                    if len(page) < min(args.page_size, args.limit_events - offset):
+                        break
+                for offset in range(0, args.limit_markets, args.page_size):
+                    page = gamma.list_markets(active="true", closed="false", order=args.order, ascending="false", limit=min(args.page_size, args.limit_markets - offset), offset=offset)
+                    markets.extend(page)
+                    if len(page) < min(args.page_size, args.limit_markets - offset):
+                        break
+            finally:
+                gamma.close()
+            label = args.label or f"active_{args.order}_{args.limit_events}_{args.limit_markets}"
+            manifest = cache.write_gamma_universe(
+                label=label,
+                events=events,
+                markets=markets,
+                params={"limit_events": args.limit_events, "limit_markets": args.limit_markets, "order": args.order, "page_size": args.page_size},
+            )
+            return {"mode": "research_data_fetch", "kind": args.kind, "manifest": manifest}
+        if args.kind == "polymarket-trades":
+            data_api = PolymarketDataApi()
+            try:
+                trades = data_api.get_trades(market=args.condition_id, limit=args.limit)
+            finally:
+                data_api.close()
+            manifest = cache.write_polymarket_trades(condition_id=args.condition_id, trades=trades, params={"condition_id": args.condition_id, "limit": args.limit})
+            return {"mode": "research_data_fetch", "kind": args.kind, "manifest": manifest}
+        if args.kind == "binance-klines":
+            binance = BinanceHistoricalClient()
+            try:
+                candles = binance.get_klines_paginated(
+                    symbol=args.symbol,
+                    interval=args.interval,
+                    start_ts_ms=args.start_ts_ms,
+                    end_ts_ms=args.end_ts_ms,
+                    limit=args.limit,
+                )
+            finally:
+                binance.close()
+            manifest = cache.write_binance_klines(
+                symbol=args.symbol,
+                interval=args.interval,
+                start_ts_ms=args.start_ts_ms,
+                end_ts_ms=args.end_ts_ms,
+                candles=candles,
+                params={
+                    "symbol": args.symbol,
+                    "interval": args.interval,
+                    "start_ts_ms": args.start_ts_ms,
+                    "end_ts_ms": args.end_ts_ms,
+                    "limit": args.limit,
+                },
+            )
+            return {"mode": "research_data_fetch", "kind": args.kind, "manifest": manifest}
+    return {"mode": "research_data_cache", "status": "unknown_command"}
 
 
 def cmd_wallet_flow_report(args: argparse.Namespace) -> int:
@@ -3838,6 +3923,25 @@ def build_parser() -> argparse.ArgumentParser:
     exp_report = research_experiments_sub.add_parser("report")
     exp_report.add_argument("--limit", type=int, default=20)
     exp_report.set_defaults(func=cmd_research)
+    research_data = research_sub.add_parser("data")
+    research_data_sub = research_data.add_subparsers(dest="data_command", required=True)
+    data_status = research_data_sub.add_parser("status")
+    data_status.set_defaults(func=cmd_research)
+    data_fetch = research_data_sub.add_parser("fetch")
+    data_fetch.add_argument("--kind", required=True, choices=["gamma-universe", "gamma-market", "polymarket-trades", "binance-klines"])
+    data_fetch.add_argument("--slug", default="")
+    data_fetch.add_argument("--condition-id", default="")
+    data_fetch.add_argument("--symbol", default="btcusdt", choices=["btcusdt", "ethusdt", "solusdt", "xrpusdt"])
+    data_fetch.add_argument("--interval", default="1m")
+    data_fetch.add_argument("--start-ts-ms", type=int, default=0)
+    data_fetch.add_argument("--end-ts-ms", type=int, default=0)
+    data_fetch.add_argument("--limit", type=int, default=1000)
+    data_fetch.add_argument("--limit-events", type=int, default=300)
+    data_fetch.add_argument("--limit-markets", type=int, default=300)
+    data_fetch.add_argument("--page-size", type=int, default=300)
+    data_fetch.add_argument("--order", default="volume_24hr")
+    data_fetch.add_argument("--label", default="")
+    data_fetch.set_defaults(func=cmd_research)
 
     scan = sub.add_parser("scan")
     scan.add_argument("--mode", default="paper", choices=["paper", "dry-run", "live"])
